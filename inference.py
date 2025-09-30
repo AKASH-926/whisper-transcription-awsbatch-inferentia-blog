@@ -194,40 +194,65 @@ for chunk in chunks:
             inputs.input_features,
             return_timestamps=True,
             return_dict_in_generate=True,
-            output_attentions=True
+            output_attentions=True,
+            no_speech_threshold=0.6,
+            condition_on_previous_text=True,
+            language="en",
+            task="transcribe"
         )
     try:
+        # Get clean text without special tokens
+        text = processor.decode(predicted_ids.sequences[0], skip_special_tokens=True)
+        
+        # Get timestamps for the entire segment
         transcription = processor.decode(predicted_ids.sequences[0], output_word_offsets=True)
-        # Extract word-level timestamps
-        words_with_timestamps = []
+        
+        # Initialize start and end times
+        start_time = None
+        end_time = None
+        
+        # Try to get timestamps from word offsets
         if hasattr(transcription, 'word_offsets') and transcription.word_offsets:
-            for word_info in transcription.word_offsets:
-                if hasattr(word_info, 'word') and hasattr(word_info, 'start_offset') and hasattr(word_info, 'end_offset'):
-                    words_with_timestamps.append({
-                        'word': word_info.word,
-                        'start_time': round(word_info.start_offset * 0.02, 2),
-                        'end_time': round(word_info.end_offset * 0.02, 2)
-                    })
-        # If no word offsets were found, fall back to basic transcription
-        if not words_with_timestamps:
-            text = processor.decode(predicted_ids.sequences[0])
-            words_with_timestamps.append({
-                'word': text.strip(),
-                'start_time': None,
-                'end_time': None
-            })
-        print(words_with_timestamps)
-        transcriptions.append(words_with_timestamps)
+            offsets = transcription.word_offsets
+            if offsets:
+                # Get first and last valid word timestamps
+                for offset in offsets:
+                    if hasattr(offset, 'start_offset') and offset.start_offset is not None:
+                        start_time = round(offset.start_offset * 0.02, 2)
+                        break
+                
+                for offset in reversed(offsets):
+                    if hasattr(offset, 'end_offset') and offset.end_offset is not None:
+                        end_time = round(offset.end_offset * 0.02, 2)
+                        break
+        
+        # If no timestamps found, estimate based on chunk duration
+        if start_time is None:
+            start_time = 0.0
+        if end_time is None:
+            # Estimate based on text length and average speaking rate
+            words = text.split()
+            end_time = round(len(words) * 0.3, 2)  # Assume 0.3 seconds per word
+        
+        # Create the sentence-level transcription
+        sentence_with_timestamp = {
+            'text': text.strip(),
+            'start_time': start_time,
+            'end_time': end_time
+        }
+        
+        print(sentence_with_timestamp)
+        transcriptions.append(sentence_with_timestamp)
     except Exception as e:
         print(f"Warning: Error processing timestamps: {str(e)}")
         # Fallback to basic transcription without timestamps
-        text = processor.decode(predicted_ids.sequences[0])
-        words_with_timestamps = [{
-            'word': text.strip(),
+        text = processor.decode(predicted_ids.sequences[0], skip_special_tokens=True)
+        sentence_with_timestamp = {
+            'text': text.strip(),
             'start_time': None,
             'end_time': None
-        }]
-        transcriptions.append(words_with_timestamps)
+        }
+        transcriptions.append(sentence_with_timestamp)
 
 print(f"Elapsed inf2: {time.time()-t}")
 
