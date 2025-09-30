@@ -185,125 +185,24 @@ chunks = waveform.split(chunk_size, dim=1)
 import time
 t=time.time()
 
-import json
-import re
-
-def get_timestamps(chunk_start_time, predicted_ids, input_features, processor, model):
-    # Get word timestamps using the model's alignment head
-    outputs = model(input_features, labels=predicted_ids, output_attentions=True)
-    cross_attentions = outputs.cross_attentions
-    
-    # Process cross attentions to get word-level timestamps
-    alignment_heads = torch.cat([layer[0] for layer in cross_attentions], dim=0)
-    alignment_heads = alignment_heads.mean(dim=0)
-    
-    # Decode tokens with their timestamps
-    tokens = processor.decode(predicted_ids[0], output_word_offsets=True).word_offsets
-    
-    # Convert token timestamps to seconds and add chunk offset
-    timestamped_words = []
-    for token in tokens:
-        start_time = chunk_start_time + (token.start_offset / input_features.shape[-1] * 30)  # 30s is chunk size
-        end_time = chunk_start_time + (token.end_offset / input_features.shape[-1] * 30)
-        timestamped_words.append({
-            'word': token.word,
-            'start': round(start_time, 2),
-            'end': round(end_time, 2)
-        })
-    
-    return timestamped_words
-
-def detect_sentences(timestamped_words):
-    # Simple sentence detection based on punctuation
-    sentence_end_chars = {'.', '!', '?'}
-    current_sentence = []
-    sentences = []
-    
-    for word_info in timestamped_words:
-        current_sentence.append(word_info)
-        if any(word_info['word'].strip().endswith(char) for char in sentence_end_chars):
-            if current_sentence:
-                sentences.append({
-                    'text': ' '.join(w['word'].strip() for w in current_sentence),
-                    'start': current_sentence[0]['start'],
-                    'end': current_sentence[-1]['end']
-                })
-                current_sentence = []
-    
-    # Add any remaining words as a sentence
-    if current_sentence:
-        sentences.append({
-            'text': ' '.join(w['word'].strip() for w in current_sentence),
-            'start': current_sentence[0]['start'],
-            'end': current_sentence[-1]['end']
-        })
-    
-    return sentences
-
-transcribed_segments = []
-chunk_start_time = 0
-
+transcriptions = []
 for chunk in chunks:
     inputs = processor(chunk.squeeze().numpy(), sampling_rate=16000, return_tensors="pt")
     with torch.no_grad():
         predicted_ids = model.generate(inputs.input_features)
-        timestamped_words = get_timestamps(chunk_start_time, predicted_ids, inputs.input_features, processor, model)
-        sentences = detect_sentences(timestamped_words)
-        transcribed_segments.extend(sentences)
-    
-    chunk_start_time += 30  # Move to next 30-second chunk
-    print(f"Processed chunk with {len(sentences)} sentences")
+    transcription = processor.decode(predicted_ids[0])
+    print(transcription)
+    transcriptions.append(transcription)
 
 print(f"Elapsed inf2: {time.time()-t}")
 
-def format_timestamp(seconds):
-    """Convert seconds to SRT timestamp format: HH:MM:SS,mmm"""
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    seconds = seconds % 60
-    milliseconds = int((seconds % 1) * 1000)
-    seconds = int(seconds)
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+# Combine the transcriptions
+full_transcription = " ".join(transcriptions)
+#print("Full Transcription:", full_transcription)
 
-def create_srt_content(segments):
-    """Convert segments to SRT format"""
-    srt_content = ""
-    for i, segment in enumerate(segments, 1):
-        start_time = format_timestamp(segment['start'])
-        end_time = format_timestamp(segment['end'])
-        srt_content += f"{i}\n{start_time} --> {end_time}\n{segment['text']}\n\n"
-    return srt_content
-
-# Format the output
-output_text = ""
-for sentence in transcribed_segments:
-    output_text += f"[{sentence['start']:.2f} - {sentence['end']:.2f}] {sentence['text']}\n"
-
-# Create SRT content
-srt_content = create_srt_content(transcribed_segments)
-
-# Save all formats (txt, json, and srt)
 output_filename = audio_path + '.txt'
-with open(output_filename, 'w') as f:
-    f.write(output_text)
+file = open(output_filename, 'w')
+file.write(full_transcription)
+file.close()
 
-json_output = {
-    'segments': transcribed_segments,
-    'metadata': {
-        'audio_file': audio_path,
-        'duration': chunk_start_time
-    }
-}
-
-json_filename = audio_path + '.json'
-with open(json_filename, 'w') as f:
-    json.dump(json_output, f, indent=2)
-
-srt_filename = audio_path + '.srt'
-with open(srt_filename, 'w') as f:
-    f.write(srt_content)
-
-# Upload all formats to S3
-s3_client.put_object(Body=output_text, Bucket=output_bucket_name, Key=output_file_prefix + output_filename)
-s3_client.put_object(Body=json.dumps(json_output, indent=2), Bucket=output_bucket_name, Key=output_file_prefix + json_filename)
-s3_client.put_object(Body=srt_content, Bucket=output_bucket_name, Key=output_file_prefix + srt_filename)
+s3_client.put_object(Body=full_transcription, Bucket=output_bucket_name, Key=output_file_prefix + output_filename)
