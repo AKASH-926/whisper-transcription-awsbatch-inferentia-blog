@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 os.environ['NEURON_RT_NUM_CORES']='1'
 import types
 import torch
@@ -189,20 +190,107 @@ transcriptions = []
 for chunk in chunks:
     inputs = processor(chunk.squeeze().numpy(), sampling_rate=16000, return_tensors="pt")
     with torch.no_grad():
-        predicted_ids = model.generate(inputs.input_features)
-    transcription = processor.decode(predicted_ids[0])
-    print(transcription)
-    transcriptions.append(transcription)
+        predicted_ids = model.generate(
+            inputs.input_features,
+            return_timestamps=True,
+            return_dict_in_generate=True,
+            output_attentions=True
+        )
+    try:
+        transcription = processor.decode(predicted_ids.sequences[0], output_word_offsets=True)
+        # Extract word-level timestamps
+        words_with_timestamps = []
+        if hasattr(transcription, 'word_offsets') and transcription.word_offsets:
+            for word_info in transcription.word_offsets:
+                if hasattr(word_info, 'word') and hasattr(word_info, 'start_offset') and hasattr(word_info, 'end_offset'):
+                    words_with_timestamps.append({
+                        'word': word_info.word,
+                        'start_time': round(word_info.start_offset * 0.02, 2),
+                        'end_time': round(word_info.end_offset * 0.02, 2)
+                    })
+        # If no word offsets were found, fall back to basic transcription
+        if not words_with_timestamps:
+            text = processor.decode(predicted_ids.sequences[0])
+            words_with_timestamps.append({
+                'word': text.strip(),
+                'start_time': None,
+                'end_time': None
+            })
+        print(words_with_timestamps)
+        transcriptions.append(words_with_timestamps)
+    except Exception as e:
+        print(f"Warning: Error processing timestamps: {str(e)}")
+        # Fallback to basic transcription without timestamps
+        text = processor.decode(predicted_ids.sequences[0])
+        words_with_timestamps = [{
+            'word': text.strip(),
+            'start_time': None,
+            'end_time': None
+        }]
+        transcriptions.append(words_with_timestamps)
 
 print(f"Elapsed inf2: {time.time()-t}")
 
-# Combine the transcriptions
-full_transcription = " ".join(transcriptions)
-#print("Full Transcription:", full_transcription)
+# Combine the transcriptions and adjust timestamps for chunks
+try:
+    full_transcription = []
+    chunk_duration = 30  # each chunk is 30 seconds
+    for chunk_idx, chunk_transcription in enumerate(transcriptions):
+        time_offset = chunk_idx * chunk_duration
+        for word_info in chunk_transcription:
+            # Only adjust timestamps if they exist
+            if word_info['start_time'] is not None and word_info['end_time'] is not None:
+                word_info['start_time'] += time_offset
+                word_info['end_time'] += time_offset
+            full_transcription.append(word_info)
 
-output_filename = audio_path + '.txt'
-file = open(output_filename, 'w')
-file.write(full_transcription)
-file.close()
+    # Convert to JSON for storage
+    output_filename = audio_path + '.json'
+    json_output = json.dumps(full_transcription, indent=2, ensure_ascii=False)
 
-s3_client.put_object(Body=full_transcription, Bucket=output_bucket_name, Key=output_file_prefix + output_filename)
+    # Save locally
+    try:
+        with open(output_filename, 'w', encoding='utf-8') as file:
+            file.write(json_output)
+    except Exception as e:
+        print(f"Warning: Failed to save local file: {str(e)}")
+
+    # Upload to S3
+    try:
+        s3_client.put_object(
+            Body=json_output.encode('utf-8'),
+            Bucket=output_bucket_name,
+            Key=output_file_prefix + output_filename,
+            ContentType='application/json; charset=utf-8'
+        )
+    except Exception as e:
+        print(f"Warning: Failed to upload to S3: {str(e)}")
+        # Write error to local file as backup
+        with open(output_filename + '.error', 'w') as f:
+            f.write(f"Failed to upload to S3: {str(e)}")
+
+except Exception as e:
+    print(f"Error processing transcription output: {str(e)}")
+    # Create a simple fallback output
+    fallback_output = {
+        'error': str(e),
+        'raw_transcriptions': [
+            [{'word': str(chunk), 'start_time': None, 'end_time': None}] 
+            for chunk in transcriptions
+        ]
+    }
+    json_output = json.dumps(fallback_output, indent=2, ensure_ascii=False)
+    
+    # Try to save fallback output
+    output_filename = audio_path + '.error.json'
+    try:
+        with open(output_filename, 'w', encoding='utf-8') as file:
+            file.write(json_output)
+        s3_client.put_object(
+            Body=json_output.encode('utf-8'),
+            Bucket=output_bucket_name,
+            Key=output_file_prefix + output_filename,
+            ContentType='application/json; charset=utf-8'
+        )
+    except Exception as save_error:
+        print(f"Failed to save error output: {str(save_error)}")
