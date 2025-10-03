@@ -193,6 +193,7 @@ chunks = waveform.split(chunk_size, dim=1)
 
 import re
 import time
+import torch
 
 t = time.time()
 all_sentences = []
@@ -211,26 +212,13 @@ for chunk in chunks:
             output_scores=True
         )
 
-    # Decode with word-level timestamps (requires transformers >= 4.35)
-    decoded = processor.batch_decode(predicted_ids.sequences, skip_special_tokens=True)[0]
-    
-    # Get word-level timestamps
-    # Note: your transformers version must support this. If yes:
-    # word_timestamps = processor(predicted_ids, word_timestamps=True)
-    # For older versions, you can fallback to approximate method.
-    try:
-        word_timestamps = processor.tokenizer.batch_decode(predicted_ids.sequences, output_word_offsets=True)[0]
-    except:
-        # fallback: approximate equal spacing
-        words = decoded.split()
-        chunk_duration = chunk.shape[1] / 16000
-        word_times = torch.linspace(0, chunk_duration, len(words))
-        word_timestamps = [{"word": w, "start": float(word_times[i]), "end": float(word_times[i]+0.5)} 
-                           for i, w in enumerate(words)]
+    # Decode with precise word-level timestamps
+    # Requires transformers >= 4.35
+    decoded = processor.batch_decode(predicted_ids.sequences, skip_special_tokens=True, word_timestamps=True)[0]
 
-    # Aggregate words into sentences
+    # decoded["words"] contains list of {"word": ..., "start": ..., "end": ...}
     sentence = {"text": "", "start": None, "end": None}
-    for w in word_timestamps:
+    for w in decoded["words"]:
         word = w['word']
         start = w['start'] + current_time
         end = w['end'] + current_time
@@ -245,9 +233,11 @@ for chunk in chunks:
             all_sentences.append(sentence)
             sentence = {"text": "", "start": None, "end": None}
 
+    # Add any remaining words as a sentence
     if sentence["text"].strip():
         all_sentences.append(sentence)
 
+    # Update current time for next chunk
     current_time += chunk.shape[1] / 16000
 
 print(f"Elapsed inference: {time.time()-t}")
@@ -257,10 +247,12 @@ full_transcription = "\n".join(
     [f"[{s['start']:.2f}s - {s['end']:.2f}s] {s['text'].strip()}" for s in all_sentences]
 )
 
+# Save locally
 output_filename = audio_path + '.txt'
 with open(output_filename, 'w') as file:
     file.write(full_transcription)
 
+# Upload to S3
 s3_client.put_object(
     Body=full_transcription,
     Bucket=output_bucket_name,
