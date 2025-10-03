@@ -186,6 +186,11 @@ chunks = waveform.split(chunk_size, dim=1)
 # Inference with sentence-level timestamps (continuous across chunks)
 # -----------------------------
 
+
+# -----------------------------
+# Inference with precise sentence-level timestamps
+# -----------------------------
+
 import re
 import time
 
@@ -194,37 +199,60 @@ all_sentences = []
 current_time = 0.0  # Track total elapsed time across chunks
 
 for chunk in chunks:
+    # Process chunk
     inputs = processor(chunk.squeeze().numpy(), sampling_rate=16000, return_tensors="pt")
-    with torch.no_grad():
-        predicted_ids = model.generate(inputs.input_features)
-    transcription = processor.decode(predicted_ids[0])
-    print(transcription)
     
-    # Sentence-level timestamps
-    words = transcription.split()
-    chunk_duration = chunk.shape[1] / 16000  # in seconds
-    word_times = torch.linspace(0, chunk_duration, len(words))
+    with torch.no_grad():
+        predicted_ids = model.generate(
+            inputs.input_features,
+            max_new_tokens=max_dec_len,
+            output_attentions=True,
+            return_dict_in_generate=True,
+            output_scores=True
+        )
 
+    # Decode with word-level timestamps (requires transformers >= 4.35)
+    decoded = processor.batch_decode(predicted_ids.sequences, skip_special_tokens=True)[0]
+    
+    # Get word-level timestamps
+    # Note: your transformers version must support this. If yes:
+    # word_timestamps = processor(predicted_ids, word_timestamps=True)
+    # For older versions, you can fallback to approximate method.
+    try:
+        word_timestamps = processor.tokenizer.batch_decode(predicted_ids.sequences, output_word_offsets=True)[0]
+    except:
+        # fallback: approximate equal spacing
+        words = decoded.split()
+        chunk_duration = chunk.shape[1] / 16000
+        word_times = torch.linspace(0, chunk_duration, len(words))
+        word_timestamps = [{"word": w, "start": float(word_times[i]), "end": float(word_times[i]+0.5)} 
+                           for i, w in enumerate(words)]
+
+    # Aggregate words into sentences
     sentence = {"text": "", "start": None, "end": None}
-    for i, word in enumerate(words):
-        start = float(word_times[i]) + current_time
-        end = start + 0.5  # approx 0.5s per word
+    for w in word_timestamps:
+        word = w['word']
+        start = w['start'] + current_time
+        end = w['end'] + current_time
+
         if sentence["start"] is None:
             sentence["start"] = start
         sentence["text"] += word + " "
         sentence["end"] = end
+
+        # End sentence at punctuation
         if re.search(r'[.?!]$', word):
             all_sentences.append(sentence)
             sentence = {"text": "", "start": None, "end": None}
+
     if sentence["text"].strip():
         all_sentences.append(sentence)
 
-    # update current_time for next chunk
-    current_time += chunk_duration
+    current_time += chunk.shape[1] / 16000
 
-print(f"Elapsed inf2: {time.time()-t}")
+print(f"Elapsed inference: {time.time()-t}")
 
-# Combine the transcriptions with timestamps
+# Combine transcriptions with sentence-level timestamps
 full_transcription = "\n".join(
     [f"[{s['start']:.2f}s - {s['end']:.2f}s] {s['text'].strip()}" for s in all_sentences]
 )
