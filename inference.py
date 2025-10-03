@@ -178,9 +178,16 @@ if waveform.shape[0] > 1:
 if sample_rate != 16000:
     waveform = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)(waveform)
 
-# chunk the audio
-chunk_size = 30*16000 # 30 seconds * 16000 samples / second
-chunks = waveform.split(chunk_size, dim=1)
+# -----------------------------
+# Chunking with overlap
+# -----------------------------
+chunk_size = 30 * 16000        # 30 seconds
+overlap = 2 * 16000            # 2 seconds overlap to avoid missing audio
+chunks, start = [], 0
+while start < waveform.shape[1]:
+    end = min(start + chunk_size, waveform.shape[1])
+    chunks.append(waveform[:, max(0, start - overlap):end])
+    start += chunk_size
 
 # -----------------------------
 # Inference with precise sentence-level timestamps
@@ -262,3 +269,45 @@ s3_client.put_object(
     Bucket=output_bucket_name,
     Key=output_file_prefix + output_filename
 )
+
+
+# -----------------------------
+# Function to save SRT
+# -----------------------------
+def seconds_to_srt_time(seconds: float) -> str:
+    """
+    Convert seconds to SRT timestamp format: HH:MM:SS,mmm
+    """
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int((seconds - int(seconds)) * 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def save_srt(sentences, output_path):
+    """
+    Save sentences with timestamps to SRT file.
+    """
+    lines = []
+    for idx, s in enumerate(sentences, start=1):
+        start_time = seconds_to_srt_time(s['start'])
+        end_time = seconds_to_srt_time(s['end'])
+        lines.append(f"{idx}\n{start_time} --> {end_time}\n{s['text'].strip()}\n")
+    
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    print(f"SRT saved to {output_path}")
+    return output_path
+
+# Save SRT locally
+srt_filename = audio_path.replace(".wav", ".srt")
+save_srt(all_sentences, srt_filename)
+
+# Upload SRT to S3
+s3_client.put_object(
+    Body=open(srt_filename, "rb"),
+    Bucket=output_bucket_name,
+    Key=output_file_prefix + srt_filename
+)
+print(f"SRT uploaded to S3 at {output_file_prefix + srt_filename}")
