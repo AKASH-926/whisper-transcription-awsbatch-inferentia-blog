@@ -183,12 +183,12 @@ chunk_size = 30*16000 # 30 seconds * 16000 samples / second
 chunks = waveform.split(chunk_size, dim=1)
 
 # -----------------------------
-# Inference with sentence-level timestamps (continuous across chunks)
+# Inference with precise sentence-level timestamps
 # -----------------------------
-import transformers
-print("transformers version:", transformers.__version__)
+
 import re
 import time
+import torch
 
 t = time.time()
 all_sentences = []
@@ -199,14 +199,24 @@ for chunk in chunks:
     inputs = processor(chunk.squeeze().numpy(), sampling_rate=16000, return_tensors="pt")
     with torch.no_grad():
         predicted_ids = model.generate(inputs.input_features)
-    transcription = processor.decode(predicted_ids[0])
-    print(transcription)
+    transcription = processor.decode(predicted_ids[0]).strip()
+
+    print("transcription:", transcription)
     
+    chunk_duration = chunk.shape[1] / 16000  # seconds
+
+    if not transcription:  
+        # If no speech detected → mark as music/silence
+        all_sentences.append({
+            "text": "[Music / Silence]",
+            "start": current_time,
+            "end": current_time + chunk_duration
+        })
+        current_time += chunk_duration
+        continue
+
     # Sentence-level timestamps
     words = transcription.split()
-    chunk_duration = chunk.shape[1] / 16000  # in seconds
-
-    # Calculate approximate word durations based on character length
     total_chars = sum(len(w) for w in words)
     char_time_ratio = chunk_duration / total_chars
 
@@ -225,7 +235,6 @@ for chunk in chunks:
 
         word_start_time = end
 
-        # End sentence at punctuation
         if re.search(r'[.?!]$', word):
             all_sentences.append(sentence)
             sentence = {"text": "", "start": None, "end": None}
@@ -233,7 +242,6 @@ for chunk in chunks:
     if sentence["text"].strip():
         all_sentences.append(sentence)
 
-    # Update current_time for next chunk
     current_time += chunk_duration
 
 print(f"Elapsed inference: {time.time()-t}")
