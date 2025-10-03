@@ -185,7 +185,7 @@ chunks = waveform.split(chunk_size, dim=1)
 # -----------------------------
 # Inference with sentence-level timestamps (continuous across chunks)
 # -----------------------------
-
+import transformers
 print("transformers version:", transformers.__version__)
 import re
 import time
