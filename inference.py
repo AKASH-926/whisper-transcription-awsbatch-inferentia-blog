@@ -183,7 +183,7 @@ chunk_size = 30*16000 # 30 seconds * 16000 samples / second
 chunks = waveform.split(chunk_size, dim=1)
 
 # -----------------------------
-# Inference with sentence-level timestamps
+# Inference with sentence-level timestamps (continuous across chunks)
 # -----------------------------
 
 import re
@@ -191,25 +191,24 @@ import time
 
 t = time.time()
 all_sentences = []
+current_time = 0.0  # Track total elapsed time across chunks
 
-for chunk in chunks:  # use the chunks already created above
+for chunk in chunks:
     inputs = processor(chunk.squeeze().numpy(), sampling_rate=16000, return_tensors="pt")
     with torch.no_grad():
         predicted_ids = model.generate(inputs.input_features)
     transcription = processor.decode(predicted_ids[0])
     print(transcription)
     
-    # -----------------------------
     # Sentence-level timestamps
-    # -----------------------------
     words = transcription.split()
     chunk_duration = chunk.shape[1] / 16000  # in seconds
     word_times = torch.linspace(0, chunk_duration, len(words))
 
     sentence = {"text": "", "start": None, "end": None}
     for i, word in enumerate(words):
-        start = float(word_times[i])
-        end = float(word_times[i]) + 0.5  # approx 0.5s per word
+        start = float(word_times[i]) + current_time
+        end = start + 0.5  # approx 0.5s per word
         if sentence["start"] is None:
             sentence["start"] = start
         sentence["text"] += word + " "
@@ -219,6 +218,9 @@ for chunk in chunks:  # use the chunks already created above
             sentence = {"text": "", "start": None, "end": None}
     if sentence["text"].strip():
         all_sentences.append(sentence)
+
+    # update current_time for next chunk
+    current_time += chunk_duration
 
 print(f"Elapsed inf2: {time.time()-t}")
 
@@ -231,4 +233,8 @@ output_filename = audio_path + '.txt'
 with open(output_filename, 'w') as file:
     file.write(full_transcription)
 
-s3_client.put_object(Body=full_transcription, Bucket=output_bucket_name, Key=output_file_prefix + output_filename)
+s3_client.put_object(
+    Body=full_transcription,
+    Bucket=output_bucket_name,
+    Key=output_file_prefix + output_filename
+)
