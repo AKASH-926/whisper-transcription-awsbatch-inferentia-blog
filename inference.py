@@ -1,6 +1,5 @@
 import os
 import sys
-import json
 os.environ['NEURON_RT_NUM_CORES']='1'
 import types
 import torch
@@ -183,139 +182,53 @@ if sample_rate != 16000:
 chunk_size = 30*16000 # 30 seconds * 16000 samples / second
 chunks = waveform.split(chunk_size, dim=1)
 
-import time
-t=time.time()
+# -----------------------------
+# Inference with sentence-level timestamps
+# -----------------------------
 
-transcriptions = []
-for chunk in chunks:
+import re
+import time
+
+t = time.time()
+all_sentences = []
+
+for chunk in chunks:  # use the chunks already created above
     inputs = processor(chunk.squeeze().numpy(), sampling_rate=16000, return_tensors="pt")
     with torch.no_grad():
-        predicted_ids = model.generate(
-            inputs.input_features,
-            return_timestamps=True,
-            return_dict_in_generate=True,
-            output_attentions=True,
-            no_speech_threshold=0.6,
-            condition_on_previous_text=True,
-            language="en",
-            task="transcribe"
-        )
-    try:
-        # Get clean text without special tokens
-        text = processor.decode(predicted_ids.sequences[0], skip_special_tokens=True)
-        
-        # Get timestamps for the entire segment
-        transcription = processor.decode(predicted_ids.sequences[0], output_word_offsets=True)
-        
-        # Initialize start and end times
-        start_time = None
-        end_time = None
-        
-        # Try to get timestamps from word offsets
-        if hasattr(transcription, 'word_offsets') and transcription.word_offsets:
-            offsets = transcription.word_offsets
-            if offsets:
-                # Get first and last valid word timestamps
-                for offset in offsets:
-                    if hasattr(offset, 'start_offset') and offset.start_offset is not None:
-                        start_time = round(offset.start_offset * 0.02, 2)
-                        break
-                
-                for offset in reversed(offsets):
-                    if hasattr(offset, 'end_offset') and offset.end_offset is not None:
-                        end_time = round(offset.end_offset * 0.02, 2)
-                        break
-        
-        # If no timestamps found, estimate based on chunk duration
-        if start_time is None:
-            start_time = 0.0
-        if end_time is None:
-            # Estimate based on text length and average speaking rate
-            words = text.split()
-            end_time = round(len(words) * 0.3, 2)  # Assume 0.3 seconds per word
-        
-        # Create the sentence-level transcription
-        sentence_with_timestamp = {
-            'text': text.strip(),
-            'start_time': start_time,
-            'end_time': end_time
-        }
-        
-        print(sentence_with_timestamp)
-        transcriptions.append(sentence_with_timestamp)
-    except Exception as e:
-        print(f"Warning: Error processing timestamps: {str(e)}")
-        # Fallback to basic transcription without timestamps
-        text = processor.decode(predicted_ids.sequences[0], skip_special_tokens=True)
-        sentence_with_timestamp = {
-            'text': text.strip(),
-            'start_time': None,
-            'end_time': None
-        }
-        transcriptions.append(sentence_with_timestamp)
+        predicted_ids = model.generate(inputs.input_features)
+    transcription = processor.decode(predicted_ids[0])
+    print(transcription)
+    
+    # -----------------------------
+    # Sentence-level timestamps
+    # -----------------------------
+    words = transcription.split()
+    chunk_duration = chunk.shape[1] / 16000  # in seconds
+    word_times = torch.linspace(0, chunk_duration, len(words))
+
+    sentence = {"text": "", "start": None, "end": None}
+    for i, word in enumerate(words):
+        start = float(word_times[i])
+        end = float(word_times[i]) + 0.5  # approx 0.5s per word
+        if sentence["start"] is None:
+            sentence["start"] = start
+        sentence["text"] += word + " "
+        sentence["end"] = end
+        if re.search(r'[.?!]$', word):
+            all_sentences.append(sentence)
+            sentence = {"text": "", "start": None, "end": None}
+    if sentence["text"].strip():
+        all_sentences.append(sentence)
 
 print(f"Elapsed inf2: {time.time()-t}")
 
-# Combine the transcriptions and adjust timestamps for chunks
-try:
-    full_transcription = []
-    chunk_duration = 30  # each chunk is 30 seconds
-    for chunk_idx, chunk_transcription in enumerate(transcriptions):
-        time_offset = chunk_idx * chunk_duration
-        for word_info in chunk_transcription:
-            # Only adjust timestamps if they exist
-            if word_info['start_time'] is not None and word_info['end_time'] is not None:
-                word_info['start_time'] += time_offset
-                word_info['end_time'] += time_offset
-            full_transcription.append(word_info)
+# Combine the transcriptions with timestamps
+full_transcription = "\n".join(
+    [f"[{s['start']:.2f}s - {s['end']:.2f}s] {s['text'].strip()}" for s in all_sentences]
+)
 
-    # Convert to JSON for storage
-    output_filename = audio_path + '.json'
-    json_output = json.dumps(full_transcription, indent=2, ensure_ascii=False)
+output_filename = audio_path + '.txt'
+with open(output_filename, 'w') as file:
+    file.write(full_transcription)
 
-    # Save locally
-    try:
-        with open(output_filename, 'w', encoding='utf-8') as file:
-            file.write(json_output)
-    except Exception as e:
-        print(f"Warning: Failed to save local file: {str(e)}")
-
-    # Upload to S3
-    try:
-        s3_client.put_object(
-            Body=json_output.encode('utf-8'),
-            Bucket=output_bucket_name,
-            Key=output_file_prefix + output_filename,
-            ContentType='application/json; charset=utf-8'
-        )
-    except Exception as e:
-        print(f"Warning: Failed to upload to S3: {str(e)}")
-        # Write error to local file as backup
-        with open(output_filename + '.error', 'w') as f:
-            f.write(f"Failed to upload to S3: {str(e)}")
-
-except Exception as e:
-    print(f"Error processing transcription output: {str(e)}")
-    # Create a simple fallback output
-    fallback_output = {
-        'error': str(e),
-        'raw_transcriptions': [
-            [{'word': str(chunk), 'start_time': None, 'end_time': None}] 
-            for chunk in transcriptions
-        ]
-    }
-    json_output = json.dumps(fallback_output, indent=2, ensure_ascii=False)
-    
-    # Try to save fallback output
-    output_filename = audio_path + '.error.json'
-    try:
-        with open(output_filename, 'w', encoding='utf-8') as file:
-            file.write(json_output)
-        s3_client.put_object(
-            Body=json_output.encode('utf-8'),
-            Bucket=output_bucket_name,
-            Key=output_file_prefix + output_filename,
-            ContentType='application/json; charset=utf-8'
-        )
-    except Exception as save_error:
-        print(f"Failed to save error output: {str(save_error)}")
+s3_client.put_object(Body=full_transcription, Bucket=output_bucket_name, Key=output_file_prefix + output_filename)
