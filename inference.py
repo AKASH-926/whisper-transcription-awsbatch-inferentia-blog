@@ -186,59 +186,55 @@ chunks = waveform.split(chunk_size, dim=1)
 # Inference with sentence-level timestamps (continuous across chunks)
 # -----------------------------
 
-
-# -----------------------------
-# Inference with precise sentence-level timestamps
-# -----------------------------
-
+print("transformers version:", transformers.__version__)
 import re
 import time
-import torch
 
 t = time.time()
 all_sentences = []
 current_time = 0.0  # Track total elapsed time across chunks
 
 for chunk in chunks:
-    # Process chunk
+    # Convert and process audio
     inputs = processor(chunk.squeeze().numpy(), sampling_rate=16000, return_tensors="pt")
-    
     with torch.no_grad():
-        predicted_ids = model.generate(
-            inputs.input_features,
-            max_new_tokens=max_dec_len,
-            output_attentions=True,
-            return_dict_in_generate=True,
-            output_scores=True
-        )
+        predicted_ids = model.generate(inputs.input_features)
+    transcription = processor.decode(predicted_ids[0])
+    print(transcription)
+    
+    # Sentence-level timestamps
+    words = transcription.split()
+    chunk_duration = chunk.shape[1] / 16000  # in seconds
 
-    # Decode with precise word-level timestamps
-    # Requires transformers >= 4.35
-    decoded = processor.batch_decode(predicted_ids.sequences, skip_special_tokens=True, word_timestamps=True)[0]
+    # Calculate approximate word durations based on character length
+    total_chars = sum(len(w) for w in words)
+    char_time_ratio = chunk_duration / total_chars
 
-    # decoded["words"] contains list of {"word": ..., "start": ..., "end": ...}
     sentence = {"text": "", "start": None, "end": None}
-    for w in decoded["words"]:
-        word = w['word']
-        start = w['start'] + current_time
-        end = w['end'] + current_time
+    word_start_time = current_time
+
+    for word in words:
+        word_duration = len(word) * char_time_ratio
+        start = word_start_time
+        end = start + word_duration
 
         if sentence["start"] is None:
             sentence["start"] = start
         sentence["text"] += word + " "
         sentence["end"] = end
 
+        word_start_time = end
+
         # End sentence at punctuation
         if re.search(r'[.?!]$', word):
             all_sentences.append(sentence)
             sentence = {"text": "", "start": None, "end": None}
 
-    # Add any remaining words as a sentence
     if sentence["text"].strip():
         all_sentences.append(sentence)
 
-    # Update current time for next chunk
-    current_time += chunk.shape[1] / 16000
+    # Update current_time for next chunk
+    current_time += chunk_duration
 
 print(f"Elapsed inference: {time.time()-t}")
 
