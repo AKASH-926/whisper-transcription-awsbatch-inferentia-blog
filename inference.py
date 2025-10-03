@@ -182,7 +182,7 @@ if sample_rate != 16000:
 # Chunking with overlap
 # -----------------------------
 chunk_size = 30 * 16000        # 30 seconds
-overlap = 2 * 16000            # 2 seconds overlap to avoid missing audio
+overlap = 5 * 16000            # 5 seconds overlap to reduce missed words
 chunks, start = [], 0
 while start < waveform.shape[1]:
     end = min(start + chunk_size, waveform.shape[1])
@@ -192,7 +192,6 @@ while start < waveform.shape[1]:
 # -----------------------------
 # Inference with precise sentence-level timestamps
 # -----------------------------
-
 import re
 import time
 import torch
@@ -200,6 +199,8 @@ import torch
 t = time.time()
 all_sentences = []
 current_time = 0.0  # Track total elapsed time across chunks
+leftover_text = ""
+leftover_time = 0.0
 
 for chunk in chunks:
     # Convert and process audio
@@ -209,10 +210,10 @@ for chunk in chunks:
     transcription = processor.decode(predicted_ids[0], skip_special_tokens=True).strip()
 
     print("transcription:", transcription)
-    
+
     chunk_duration = chunk.shape[1] / 16000  # seconds
 
-    if not transcription:  
+    if not transcription:
         # If no speech detected → mark as music/silence
         all_sentences.append({
             "text": "[Music / Silence]",
@@ -222,15 +223,23 @@ for chunk in chunks:
         current_time += chunk_duration
         continue
 
+    # Prepend leftover text from previous chunk
+    if leftover_text:
+        transcription = leftover_text + " " + transcription
+        word_start_time = leftover_time
+        leftover_text = ""
+        leftover_time = 0.0
+    else:
+        word_start_time = current_time
+
     # Sentence-level timestamps
     words = transcription.split()
     total_chars = sum(len(w) for w in words)
     char_time_ratio = chunk_duration / total_chars
 
     sentence = {"text": "", "start": None, "end": None}
-    word_start_time = current_time
 
-    for word in words:
+    for i, word in enumerate(words):
         word_duration = len(word) * char_time_ratio
         start = word_start_time
         end = start + word_duration
@@ -242,18 +251,29 @@ for chunk in chunks:
 
         word_start_time = end
 
+        # If word ends with punctuation → finalize sentence
         if re.search(r'[.?!]$', word):
             all_sentences.append(sentence)
             sentence = {"text": "", "start": None, "end": None}
 
+    # Handle leftover words (sentence not ended by punctuation)
     if sentence["text"].strip():
-        all_sentences.append(sentence)
+        leftover_text = sentence["text"].strip()
+        leftover_time = sentence["start"]
 
     current_time += chunk_duration
 
+# Add any leftover sentence as final
+if leftover_text:
+    all_sentences.append({
+        "text": leftover_text,
+        "start": leftover_time,
+        "end": current_time
+    })
+
 print(f"Elapsed inference: {time.time()-t}")
 
-# Combine transcriptions with sentence-level timestamps
+# Combine transcriptions with sentence-level timestamps for txt
 full_transcription = "\n".join(
     [f"[{s['start']:.2f}s - {s['end']:.2f}s] {s['text'].strip()}" for s in all_sentences]
 )
@@ -270,14 +290,10 @@ s3_client.put_object(
     Key=output_file_prefix + output_filename
 )
 
-
 # -----------------------------
 # Function to save SRT
 # -----------------------------
 def seconds_to_srt_time(seconds: float) -> str:
-    """
-    Convert seconds to SRT timestamp format: HH:MM:SS,mmm
-    """
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
@@ -288,13 +304,31 @@ def seconds_to_srt_time(seconds: float) -> str:
 def save_srt(sentences, output_path):
     """
     Save sentences with timestamps to SRT file.
+    Merges very short sentences (<0.5s) with previous one for smoother reading.
     """
     lines = []
+    buffer_sentence = None
+
     for idx, s in enumerate(sentences, start=1):
-        start_time = seconds_to_srt_time(s['start'])
-        end_time = seconds_to_srt_time(s['end'])
-        lines.append(f"{idx}\n{start_time} --> {end_time}\n{s['text'].strip()}\n")
-    
+        # Merge tiny sentences with previous
+        duration = s['end'] - s['start']
+        if duration < 0.5 and buffer_sentence is not None:
+            buffer_sentence['text'] += " " + s['text'].strip()
+            buffer_sentence['end'] = s['end']
+            continue
+        else:
+            if buffer_sentence is not None:
+                start_time = seconds_to_srt_time(buffer_sentence['start'])
+                end_time = seconds_to_srt_time(buffer_sentence['end'])
+                lines.append(f"{len(lines)//4 + 1}\n{start_time} --> {end_time}\n{buffer_sentence['text'].strip()}\n")
+            buffer_sentence = s
+
+    # Write the last buffered sentence
+    if buffer_sentence is not None:
+        start_time = seconds_to_srt_time(buffer_sentence['start'])
+        end_time = seconds_to_srt_time(buffer_sentence['end'])
+        lines.append(f"{len(lines)//4 + 1}\n{start_time} --> {end_time}\n{buffer_sentence['text'].strip()}\n")
+
     with open(output_path, "w", encoding="utf-8") as f:
         f.writelines(lines)
     print(f"SRT saved to {output_path}")
