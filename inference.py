@@ -219,7 +219,12 @@ for chunk in chunks:
     inputs = processor(chunk.squeeze().numpy(), sampling_rate=16000, return_tensors="pt")
     with torch.no_grad():
         predicted_ids = model.generate(inputs.input_features)
-        outputs = model(input_features=inputs.input_features, output_attentions=True, return_dict=True)
+        outputs = model(
+        input_features=inputs.input_features,
+        decoder_input_ids=predicted_ids,
+        output_attentions=True,
+        return_dict=True
+        )
 
     transcription = processor.decode(predicted_ids[0], skip_special_tokens=True).strip()
     print("transcription:", transcription)
