@@ -192,6 +192,11 @@ while start < waveform.shape[1]:
 # -----------------------------
 # Inference with actual word-level timestamps
 # -----------------------------
+
+import time    
+import torch      
+import torchaudio
+
 t = time.time()
 all_words = []
 current_time = 0.0  # Track total elapsed time across chunks
