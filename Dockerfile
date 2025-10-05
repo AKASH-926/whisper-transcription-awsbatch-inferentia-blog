@@ -6,11 +6,6 @@ WORKDIR /app
 COPY requirements.txt requirements.txt
 COPY inference.py inference.py
 
-# Pin protobuf to 3.9.2 to match Neuron SDK
-RUN sed -i '/protobuf/d' requirements.txt
-RUN echo -e "\nprotobuf==3.9.2" >> requirements.txt
-
-
 RUN pip install -U --no-cache-dir -r requirements.txt
 
 # Exit container after the job is done
