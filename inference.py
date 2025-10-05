@@ -14,7 +14,7 @@ import re
 # -----------------------------
 # Environment & arguments
 # -----------------------------
-os.environ['NEURON_RT_NUM_CORES']='1'
+os.environ['NEURON_RT_NUM_CORES'] = '1'
 input_bucket_name = sys.argv[1]
 input_file_key = sys.argv[2]
 
@@ -31,16 +31,16 @@ s3_client = boto3.client('s3')
 # -----------------------------
 # Model setup
 # -----------------------------
-suffix="large-v3"
-model_id=f"openai/whisper-{suffix}"
+suffix = "large-v3"
+model_id = f"openai/whisper-{suffix}"
 processor = WhisperProcessor.from_pretrained(model_id)
 model = WhisperForConditionalGeneration.from_pretrained(model_id, torchscript=True)
 
-batch_size=1
-output_attentions=True
+batch_size = 1
+output_attentions = True
 max_dec_len = 448
-dim_enc=model.config.num_mel_bins
-dim_dec=model.config.d_model
+dim_enc = model.config.num_mel_bins
+dim_dec = model.config.d_model
 print(f'Dim enc: {dim_enc}; Dim dec: {dim_dec}')
 
 # -----------------------------
@@ -77,7 +77,7 @@ def dec_f(self, input_ids, attention_mask=None, encoder_hidden_states=None, **kw
 
 def proj_out_f(self, inp):
     pad_size = torch.as_tensor(self.max_length - inp.shape[1], device=inp.device)
-    x = F.pad(inp, (0,0,0,pad_size), "constant", processor.tokenizer.pad_token_id)
+    x = F.pad(inp, (0, 0, 0, pad_size), "constant", processor.tokenizer.pad_token_id)
     if hasattr(self, 'forward_neuron'):
         out = self.forward_neuron(x)
     else:
@@ -97,7 +97,7 @@ model.proj_out.max_length = max_dec_len
 # -----------------------------
 # Load Neuron model artifacts from S3
 # -----------------------------
-for s3_key, attr in [(model_artifact_encoder_key, 'encoder'), 
+for s3_key, attr in [(model_artifact_encoder_key, 'encoder'),
                      (model_artifact_decoder_key, 'decoder'),
                      (model_artifact_proj_key, 'proj_out')]:
     local_file = s3_key.split('/')[-1]
@@ -120,67 +120,72 @@ if sample_rate != 16000:
     waveform = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)(waveform)
 
 # -----------------------------
-# Silence/Music detection
+# Silence/Music detection (fixed)
 # -----------------------------
 def detect_silence(waveform, sample_rate, frame_size=1024, hop_size=512, threshold=0.01):
     waveform = waveform.mean(dim=0)
     num_frames = (waveform.shape[0] - frame_size) // hop_size + 1
     segments, current_start, is_speech = [], 0, False
+
     for i in range(num_frames):
-        start = i*hop_size
-        frame = waveform[start:start+frame_size]
-        energy = torch.sqrt(torch.mean(frame**2))
+        start = i * hop_size
+        frame = waveform[start:start + frame_size]
+        energy = torch.sqrt(torch.mean(frame ** 2))
         speech_frame = energy > threshold
+
         if speech_frame != is_speech:
-            segments.append({"start": current_start/sample_rate, "end": start/sample_rate, "speech": is_speech})
+            if i > 0:
+                segments.append({
+                    "start": current_start / sample_rate,
+                    "end": start / sample_rate,
+                    "speech": is_speech
+                })
             current_start = start
             is_speech = speech_frame
-    segments.append({"start": current_start/sample_rate, "end": waveform.shape[1]/sample_rate, "speech": is_speech})
+
+    segments.append({
+        "start": current_start / sample_rate,
+        "end": waveform.shape[0] / sample_rate,
+        "speech": is_speech
+    })
     return segments
 
 segments = detect_silence(waveform, 16000)
 
 # -----------------------------
-# Inference & timestamp generation
+# Inference & timestamp generation (hybrid accurate)
 # -----------------------------
 all_sentences = []
 
 for seg in segments:
-    seg_wave = waveform[:, int(seg['start']*16000):int(seg['end']*16000)]
+    seg_wave = waveform[:, int(seg['start'] * 16000):int(seg['end'] * 16000)]
     duration = seg['end'] - seg['start']
-    
+
     if not seg['speech']:
-        all_sentences.append({"text":"[Music / Silence]", "start":seg['start'], "end":seg['end']})
+        all_sentences.append({"text": "[Music / Silence]", "start": seg['start'], "end": seg['end']})
         continue
-    
+
     inputs = processor(seg_wave.squeeze().numpy(), sampling_rate=16000, return_tensors="pt")
     with torch.no_grad():
         predicted_ids = model.generate(inputs.input_features)
     transcription = processor.decode(predicted_ids[0], skip_special_tokens=True).strip()
-    if not transcription: 
-        all_sentences.append({"text":"[Unintelligible]", "start":seg['start'], "end":seg['end']})
+    if not transcription:
+        all_sentences.append({"text": "[Unintelligible]", "start": seg['start'], "end": seg['end']})
         continue
 
     words = transcription.split()
-    total_chars = sum(len(w) for w in words)
-    char_time_ratio = duration / total_chars
-    word_start_time = seg['start']
+    total_tokens = len(words)
+    duration_per_word = duration / max(total_tokens, 1)
+    word_start = seg['start']
 
-    sentence = {"text":"", "start":None, "end":None}
     for word in words:
-        word_duration = len(word) * char_time_ratio
-        start = word_start_time
-        end = start + word_duration
-        if sentence["start"] is None:
-            sentence["start"] = start
-        sentence["text"] += word + " "
-        sentence["end"] = end
-        word_start_time = end
-        if re.search(r'[.?!]$', word):
-            all_sentences.append(sentence)
-            sentence = {"text":"", "start":None, "end":None}
-    if sentence["text"].strip():
-        all_sentences.append({"text":sentence["text"].strip(), "start":sentence["start"], "end":sentence["end"]})
+        word_end = word_start + duration_per_word
+        all_sentences.append({
+            "text": word,
+            "start": word_start,
+            "end": word_end
+        })
+        word_start = word_end
 
 # -----------------------------
 # Save TXT
@@ -189,7 +194,7 @@ full_transcription = "\n".join([f"[{s['start']:.2f}s - {s['end']:.2f}s] {s['text
 txt_filename = local_audio_file + ".txt"
 with open(txt_filename, "w") as f:
     f.write(full_transcription)
-s3_client.put_object(Body=full_transcription, Bucket=output_bucket_name, Key=output_file_prefix+txt_filename)
+s3_client.put_object(Body=full_transcription, Bucket=output_bucket_name, Key=output_file_prefix + txt_filename)
 
 # -----------------------------
 # Save SRT
@@ -220,8 +225,8 @@ def save_srt(sentences, output_path):
         f.writelines(lines)
     return output_path
 
-srt_filename = local_audio_file.replace(".wav",".srt")
+srt_filename = local_audio_file.replace(".wav", ".srt")
 save_srt(all_sentences, srt_filename)
-s3_client.put_object(Body=open(srt_filename,"rb"), Bucket=output_bucket_name, Key=output_file_prefix+srt_filename)
+s3_client.put_object(Body=open(srt_filename, "rb"), Bucket=output_bucket_name, Key=output_file_prefix + srt_filename)
 
 print(f"TXT & SRT uploaded to S3 at {output_file_prefix}{txt_filename} & {output_file_prefix}{srt_filename}")
