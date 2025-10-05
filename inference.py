@@ -10,6 +10,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttenti
 import boto3
 import time
 import re
+import torch_neuronx
 
 # -----------------------------
 # Environment & arguments
@@ -77,7 +78,7 @@ def dec_f(self, input_ids, attention_mask=None, encoder_hidden_states=None, **kw
 
 def proj_out_f(self, inp):
     pad_size = torch.as_tensor(self.max_length - inp.shape[1], device=inp.device)
-    x = F.pad(inp, (0, 0, 0, pad_size), "constant", processor.tokenizer.pad_token_id)
+    x = F.pad(inp, (0, 0, 0, pad_size), "constant", 0.0)  # pad with 0.0 for features
     if hasattr(self, 'forward_neuron'):
         out = self.forward_neuron(x)
     else:
@@ -104,7 +105,8 @@ for s3_key, attr in [(model_artifact_encoder_key, 'encoder'),
     s3_client.download_file(model_artifact_bucket_name, s3_key, local_file)
     if not os.path.isfile(local_file):
         raise Exception(f"{attr} model artifact not found.")
-    setattr(model.model if attr != 'proj_out' else model, f"{attr}.forward_neuron", torch.jit.load(local_file))
+    setattr(model.model if attr != 'proj_out' else model, f"{attr}.forward_neuron",
+            torch.jit.load(local_file, map_location=torch.device("cpu")))
 
 # -----------------------------
 # Load input audio from S3
@@ -120,7 +122,7 @@ if sample_rate != 16000:
     waveform = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)(waveform)
 
 # -----------------------------
-# Silence/Music detection (fixed)
+# Silence/Music detection
 # -----------------------------
 def detect_silence(waveform, sample_rate, frame_size=1024, hop_size=512, threshold=0.01):
     waveform = waveform.mean(dim=0)
@@ -131,7 +133,7 @@ def detect_silence(waveform, sample_rate, frame_size=1024, hop_size=512, thresho
         start = i * hop_size
         frame = waveform[start:start + frame_size]
         energy = torch.sqrt(torch.mean(frame ** 2))
-        speech_frame = energy > threshold
+        speech_frame = float(energy) > threshold
 
         if speech_frame != is_speech:
             if i > 0:
@@ -153,7 +155,7 @@ def detect_silence(waveform, sample_rate, frame_size=1024, hop_size=512, thresho
 segments = detect_silence(waveform, 16000)
 
 # -----------------------------
-# Inference & timestamp generation (hybrid accurate)
+# Inference & timestamp generation
 # -----------------------------
 all_sentences = []
 
