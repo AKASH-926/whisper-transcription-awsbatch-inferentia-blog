@@ -190,32 +190,27 @@ while start < waveform.shape[1]:
     start += chunk_size
 
 # -----------------------------
-# Inference with precise sentence-level timestamps
+# Inference with actual word-level timestamps
 # -----------------------------
-import re
-import time
-import torch
-
 t = time.time()
-all_sentences = []
+all_words = []
 current_time = 0.0  # Track total elapsed time across chunks
-leftover_text = ""
-leftover_time = 0.0
 
 for chunk in chunks:
     # Convert and process audio
     inputs = processor(chunk.squeeze().numpy(), sampling_rate=16000, return_tensors="pt")
     with torch.no_grad():
         predicted_ids = model.generate(inputs.input_features)
-    transcription = processor.decode(predicted_ids[0], skip_special_tokens=True).strip()
+        outputs = model(input_features=inputs.input_features, output_attentions=True, return_dict=True)
 
+    transcription = processor.decode(predicted_ids[0], skip_special_tokens=True).strip()
     print("transcription:", transcription)
 
     chunk_duration = chunk.shape[1] / 16000  # seconds
 
+    # If no speech detected → mark as music/silence
     if not transcription:
-        # If no speech detected → mark as music/silence
-        all_sentences.append({
+        all_words.append({
             "text": "[Music / Silence]",
             "start": current_time,
             "end": current_time + chunk_duration
@@ -223,74 +218,35 @@ for chunk in chunks:
         current_time += chunk_duration
         continue
 
-    # Merge leftover text from previous chunk (avoid double spacing)
-    if leftover_text:
-        transcription = (leftover_text + " " + transcription).strip()
-        word_start_time = leftover_time
-        leftover_text, leftover_time = "", 0.0
-    else:
-        word_start_time = current_time
-
-    # Sentence-level timestamps with proportional timing
-    words = transcription.split()
-    if not words:
-        current_time += chunk_duration
-        continue
-
-    # Adjust time ratio based on full text (including spaces)
-    total_chars = len(transcription)
-    char_time_ratio = chunk_duration / total_chars
-
-    sentence = {"text": "", "start": None, "end": None}
-
-    for i, word in enumerate(words):
-        word_duration = len(word) * char_time_ratio
-        start = word_start_time
-        end = start + word_duration
-
-        if sentence["start"] is None:
-            sentence["start"] = start
-        sentence["text"] += word + " "
-        sentence["end"] = end
-
-        word_start_time = end
-
-        # If word ends with punctuation → finalize sentence
-        if re.search(r'[.?!]$', word):
-            all_sentences.append(sentence)
-            sentence = {"text": "", "start": None, "end": None}
-
-    # If chunk ended mid-sentence → carry over text to next chunk
-    if sentence["text"].strip():
-        leftover_text = sentence["text"].strip()
-        leftover_time = sentence["start"]
-    else:
-        leftover_text = ""
-        leftover_time = 0.0
-
+    # Use attention weights to calculate word-level timestamps
+    if outputs.cross_attentions is not None:
+        attentions = outputs.cross_attentions[-1][0].mean(dim=0)  # average over heads
+        tokens = predicted_ids[0]
+        times = torch.linspace(0, chunk_duration, attentions.shape[-1])
+        for i, token_id in enumerate(tokens):
+            token_str = processor.tokenizer.decode([token_id.item()])
+            start_time = times[i].item()
+            end_time = times[i + 1].item() if i + 1 < len(times) else current_time + chunk_duration
+            all_words.append({
+                "text": token_str,
+                "start": current_time + start_time,
+                "end": current_time + end_time
+            })
     current_time += chunk_duration
 
-# Final flush for leftover text
-if leftover_text.strip():
-    all_sentences.append({
-        "text": leftover_text.strip(),
-        "start": leftover_time,
-        "end": current_time
-    })
+print(f"Elapsed inference: {time.time() - t}")
 
-print(f"Elapsed inference: {time.time()-t}")
-
-# Combine transcriptions with sentence-level timestamps for txt
+# Combine transcriptions for TXT
 full_transcription = "\n".join(
-    [f"[{s['start']:.2f}s - {s['end']:.2f}s] {s['text'].strip()}" for s in all_sentences]
+    [f"[{w['start']:.2f}s - {w['end']:.2f}s] {w['text'].strip()}" for w in all_words]
 )
 
-# Save locally
+# Save TXT locally
 output_filename = audio_path + '.txt'
 with open(output_filename, 'w') as file:
     file.write(full_transcription)
 
-# Upload to S3
+# Upload TXT to S3
 s3_client.put_object(
     Body=full_transcription,
     Bucket=output_bucket_name,
@@ -298,7 +254,7 @@ s3_client.put_object(
 )
 
 # -----------------------------
-# Function to save SRT
+# Save SRT
 # -----------------------------
 def seconds_to_srt_time(seconds: float) -> str:
     hours = int(seconds // 3600)
@@ -307,30 +263,23 @@ def seconds_to_srt_time(seconds: float) -> str:
     millis = int((seconds - int(seconds)) * 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
-
-def save_srt(sentences, output_path):
-    """
-    Save sentences with timestamps to SRT file.
-    Merges very short sentences (<0.5s) with previous one for smoother reading.
-    """
+def save_srt(words, output_path):
     lines = []
     buffer_sentence = None
 
-    for idx, s in enumerate(sentences, start=1):
-        # Merge tiny sentences with previous
-        duration = s['end'] - s['start']
+    for idx, w in enumerate(words, start=1):
+        duration = w['end'] - w['start']
         if duration < 0.5 and buffer_sentence is not None:
-            buffer_sentence['text'] += " " + s['text'].strip()
-            buffer_sentence['end'] = s['end']
+            buffer_sentence['text'] += " " + w['text'].strip()
+            buffer_sentence['end'] = w['end']
             continue
         else:
             if buffer_sentence is not None:
                 start_time = seconds_to_srt_time(buffer_sentence['start'])
                 end_time = seconds_to_srt_time(buffer_sentence['end'])
                 lines.append(f"{len(lines)//4 + 1}\n{start_time} --> {end_time}\n{buffer_sentence['text'].strip()}\n")
-            buffer_sentence = s
+            buffer_sentence = w
 
-    # Write the last buffered sentence
     if buffer_sentence is not None:
         start_time = seconds_to_srt_time(buffer_sentence['start'])
         end_time = seconds_to_srt_time(buffer_sentence['end'])
@@ -343,7 +292,7 @@ def save_srt(sentences, output_path):
 
 # Save SRT locally
 srt_filename = audio_path.replace(".wav", ".srt")
-save_srt(all_sentences, srt_filename)
+save_srt(all_words, srt_filename)
 
 # Upload SRT to S3
 s3_client.put_object(
