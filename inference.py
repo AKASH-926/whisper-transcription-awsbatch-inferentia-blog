@@ -60,39 +60,33 @@ from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttenti
 # to invoke the model on inf2
 def enc_f(self, input_features, attention_mask=None, **kwargs):
     if hasattr(self, 'forward_neuron'):
-        if attention_mask is None:
-            out = self.forward_neuron(input_features)
-        else:
-            out = self.forward_neuron(input_features, attention_mask)
+        # Ensure 2 arguments are always passed
+        dummy_mask = attention_mask
+        if dummy_mask is None:
+            dummy_mask = torch.zeros(input_features.shape[:-1], dtype=torch.float32)
+        out = self.forward_neuron(input_features, dummy_mask)
     else:
         out = self.forward_(input_features, attention_mask, return_dict=True)
     return BaseModelOutput(**out)
 
 
 def dec_f(self, input_ids, attention_mask=None, encoder_hidden_states=None, **kwargs):
-    out = None
-
-    # Swap None values if needed (Neuron workaround)
-    if attention_mask is not None and encoder_hidden_states is None:
-        encoder_hidden_states, attention_mask = attention_mask, encoder_hidden_states
-
-    inp = [input_ids, encoder_hidden_states]
-
-    # Pad input to max_dec_len
-    if inp[0].shape[1] > self.max_length:
+    # Pad input_ids
+    if input_ids.shape[1] > self.max_length:
         raise Exception(f"The decoded sequence is not supported. Max: {self.max_length}")
-    pad_size = torch.as_tensor(self.max_length - inp[0].shape[1])
-    inp[0] = F.pad(inp[0], (0, pad_size), "constant", processor.tokenizer.pad_token_id)
+    pad_size = torch.as_tensor(self.max_length - input_ids.shape[1])
+    input_ids_padded = F.pad(input_ids, (0, pad_size), "constant", processor.tokenizer.pad_token_id)
+
+    # Provide dummy encoder_hidden_states if None
+    if encoder_hidden_states is None:
+        encoder_hidden_states = torch.zeros((input_ids.shape[0], input_ids.shape[1], model.config.d_model))
 
     if hasattr(self, 'forward_neuron'):
-        if encoder_hidden_states is not None:
-            out = self.forward_neuron(inp[0], inp[1])
-        else:
-            out = self.forward_neuron(inp[0])
+        out = self.forward_neuron(input_ids_padded, encoder_hidden_states)
     else:
         out = self.forward_(
-            input_ids=inp[0],
-            encoder_hidden_states=inp[1],
+            input_ids=input_ids_padded,
+            encoder_hidden_states=encoder_hidden_states,
             return_dict=True,
             use_cache=False,
             output_attentions=output_attentions
@@ -101,7 +95,7 @@ def dec_f(self, input_ids, attention_mask=None, encoder_hidden_states=None, **kw
     # Unpad output
     out['last_hidden_state'] = out['last_hidden_state'][:, :input_ids.shape[1], :]
 
-    # Stack attentions if present
+    # Stack attentions
     if out.get('attentions') is not None:
         out['attentions'] = torch.stack([
             torch.mean(o[:, :, :input_ids.shape[1], :input_ids.shape[1]], dim=2, keepdim=True)
@@ -114,6 +108,7 @@ def dec_f(self, input_ids, attention_mask=None, encoder_hidden_states=None, **kw
         ])
 
     return BaseModelOutputWithPastAndCrossAttentions(**out)
+
 
 
 if not hasattr(model.model.encoder, 'forward_'): 
