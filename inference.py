@@ -223,18 +223,22 @@ for chunk in chunks:
         current_time += chunk_duration
         continue
 
-    # Prepend leftover text from previous chunk
+    # Merge leftover text from previous chunk (avoid double spacing)
     if leftover_text:
-        transcription = leftover_text + " " + transcription
+        transcription = (leftover_text + " " + transcription).strip()
         word_start_time = leftover_time
-        leftover_text = ""
-        leftover_time = 0.0
+        leftover_text, leftover_time = "", 0.0
     else:
         word_start_time = current_time
 
-    # Sentence-level timestamps
+    # Sentence-level timestamps with proportional timing
     words = transcription.split()
-    total_chars = sum(len(w) for w in words)
+    if not words:
+        current_time += chunk_duration
+        continue
+
+    # Adjust time ratio based on full text (including spaces)
+    total_chars = len(transcription)
     char_time_ratio = chunk_duration / total_chars
 
     sentence = {"text": "", "start": None, "end": None}
@@ -256,17 +260,20 @@ for chunk in chunks:
             all_sentences.append(sentence)
             sentence = {"text": "", "start": None, "end": None}
 
-    # Handle leftover words (sentence not ended by punctuation)
+    # If chunk ended mid-sentence → carry over text to next chunk
     if sentence["text"].strip():
         leftover_text = sentence["text"].strip()
         leftover_time = sentence["start"]
+    else:
+        leftover_text = ""
+        leftover_time = 0.0
 
     current_time += chunk_duration
 
-# Add any leftover sentence as final
-if leftover_text:
+# Final flush for leftover text
+if leftover_text.strip():
     all_sentences.append({
-        "text": leftover_text,
+        "text": leftover_text.strip(),
         "start": leftover_time,
         "end": current_time
     })
