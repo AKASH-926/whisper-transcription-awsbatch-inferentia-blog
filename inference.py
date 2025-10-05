@@ -58,45 +58,63 @@ from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttenti
 # compilable. Please notice that these methods overwrite the original ones, but
 # keeps retro-compatibility. Also, we'll use use a new variable "forward_neuron"
 # to invoke the model on inf2
-def enc_f(self, input_features, attention_mask, **kwargs):
+def enc_f(self, input_features, attention_mask=None, **kwargs):
     if hasattr(self, 'forward_neuron'):
-        out = self.forward_neuron(input_features, attention_mask)
+        if attention_mask is None:
+            out = self.forward_neuron(input_features)
+        else:
+            out = self.forward_neuron(input_features, attention_mask)
     else:
         out = self.forward_(input_features, attention_mask, return_dict=True)
     return BaseModelOutput(**out)
 
+
 def dec_f(self, input_ids, attention_mask=None, encoder_hidden_states=None, **kwargs):
-    out = None        
-    if not attention_mask is None and encoder_hidden_states is None:
-        # this is a workaround to align the input parameters for NeuronSDK tracer
-        # None values are not allowed during compilation
-        encoder_hidden_states, attention_mask = attention_mask,encoder_hidden_states
+    out = None
+
+    # Swap None values if needed (Neuron workaround)
+    if attention_mask is not None and encoder_hidden_states is None:
+        encoder_hidden_states, attention_mask = attention_mask, encoder_hidden_states
+
     inp = [input_ids, encoder_hidden_states]
-    
-    # pad the input to max_dec_len
+
+    # Pad input to max_dec_len
     if inp[0].shape[1] > self.max_length:
         raise Exception(f"The decoded sequence is not supported. Max: {self.max_length}")
     pad_size = torch.as_tensor(self.max_length - inp[0].shape[1])
     inp[0] = F.pad(inp[0], (0, pad_size), "constant", processor.tokenizer.pad_token_id)
-    
+
     if hasattr(self, 'forward_neuron'):
-        out = self.forward_neuron(*inp)
+        if encoder_hidden_states is not None:
+            out = self.forward_neuron(inp[0], inp[1])
+        else:
+            out = self.forward_neuron(inp[0])
     else:
-        # output_attentions is required if you want timestamps
-        out = self.forward_(input_ids=inp[0], encoder_hidden_states=inp[1], return_dict=True, use_cache=False, output_attentions=output_attentions)
-    # unpad the output
+        out = self.forward_(
+            input_ids=inp[0],
+            encoder_hidden_states=inp[1],
+            return_dict=True,
+            use_cache=False,
+            output_attentions=output_attentions
+        )
+
+    # Unpad output
     out['last_hidden_state'] = out['last_hidden_state'][:, :input_ids.shape[1], :]
-    # neuron compiler doesn't like tuples as values of dicts, so we stack them into tensors
-    # also, we need to average axis=2 given we're not using cache (use_cache=False)
-    # that way, to avoid an issue with the pipeline we change the shape from:
-    #  bs,num selected,num_tokens,1500 --> bs,1,num_tokens,1500
-    # I suspect there is a bug in the HF pipeline code that doesn't support use_cache=False for
-    # word timestamps, that's why we need that.
-    if not out.get('attentions') is None:
-        out['attentions'] = torch.stack([torch.mean(o[:, :, :input_ids.shape[1], :input_ids.shape[1]], axis=2, keepdim=True) for o in out['attentions']])
-    if not out.get('cross_attentions') is None:
-        out['cross_attentions'] = torch.stack([torch.mean(o[:, :, :input_ids.shape[1], :], axis=2, keepdim=True) for o in out['cross_attentions']])
+
+    # Stack attentions if present
+    if out.get('attentions') is not None:
+        out['attentions'] = torch.stack([
+            torch.mean(o[:, :, :input_ids.shape[1], :input_ids.shape[1]], dim=2, keepdim=True)
+            for o in out['attentions']
+        ])
+    if out.get('cross_attentions') is not None:
+        out['cross_attentions'] = torch.stack([
+            torch.mean(o[:, :, :input_ids.shape[1], :], dim=2, keepdim=True)
+            for o in out['cross_attentions']
+        ])
+
     return BaseModelOutputWithPastAndCrossAttentions(**out)
+
 
 if not hasattr(model.model.encoder, 'forward_'): 
     model.model.encoder.forward_ = model.model.encoder.forward
