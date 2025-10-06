@@ -185,8 +185,10 @@ chunks = waveform.split(chunk_size, dim=1)
 import time
 
 # Check if the model has the right configuration for timestamps
-# Timestamp tokens in Whisper tokenizer typically start at token ID 50364
-timestamp_begin = processor.tokenizer.timestamp_begin
+# Get timestamp token IDs from the tokenizer
+timestamp_ids = processor.tokenizer.timestamp_ids()
+timestamp_begin = min(timestamp_ids) if timestamp_ids else 50364
+print(f"Timestamp token IDs: {timestamp_ids[:10]}... (showing first 10)")
 print(f"Timestamp begin token ID: {timestamp_begin}")
 print(f"Model generation config: {model.generation_config}")
 
