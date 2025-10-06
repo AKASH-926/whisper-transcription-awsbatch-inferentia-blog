@@ -220,9 +220,26 @@ for chunk in chunks:
     # Debug: print the actual token IDs
     print(f"Predicted token IDs: {predicted_ids[0][:50]}")  # First 50 tokens
     
-    # Decode with timestamps
-    transcription = processor.batch_decode(predicted_ids, skip_special_tokens=False)[0]
-    print(f"Full transcription with tokens: {transcription}")
+    # Manually build transcription with timestamps
+    # Convert token IDs to text, preserving timestamp tokens
+    tokens = predicted_ids[0].tolist()
+    transcription_parts = []
+    
+    for token_id in tokens:
+        if token_id in timestamp_ids:
+            # Convert timestamp token ID to time in seconds
+            # Whisper timestamp tokens start at timestamp_begin and each represents 0.02 second intervals
+            # So: time = (token_id - timestamp_begin) * 0.02
+            time_seconds = (token_id - timestamp_begin) * 0.02
+            transcription_parts.append(f"<|{time_seconds:.2f}|>")
+        else:
+            # Decode regular token
+            token_text = processor.tokenizer.decode([token_id], skip_special_tokens=False)
+            if token_text:
+                transcription_parts.append(token_text)
+    
+    transcription = "".join(transcription_parts)
+    print(f"Full transcription with timestamps: {transcription}")
     transcriptions.append(transcription)
 
 print(f"Elapsed inf2: {time.time()-t}")
