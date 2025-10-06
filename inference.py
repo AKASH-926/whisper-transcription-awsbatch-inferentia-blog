@@ -265,13 +265,15 @@ for chunk_idx, chunk in enumerate(chunks):
             # Add chunk_offset to make timestamps continuous across the entire audio
             time_seconds = (token_id - timestamp_begin) * 0.02 + chunk_offset
             
+            # Always update last_timestamp to track where we are in the audio
+            last_timestamp = time_seconds
+            
             # Skip timestamps in the overlap region for non-first chunks
             # Keep only timestamps >= chunk_offset + 5 seconds (after overlap)
             if chunk_idx > 0 and time_seconds < chunk_offset + 5.0:
-                continue  # Skip this timestamp and associated text (it's in the overlap)
+                continue  # Skip this timestamp token from output (but timestamp was tracked above)
             
             transcription_parts.append(f"<|{time_seconds:.2f}|>")
-            last_timestamp = time_seconds
         elif nospeech_token_id and token_id in nospeech_token_id:
             # Detected silence/no-speech segment
             if chunk_idx == 0 or last_timestamp >= chunk_offset + 5.0:
@@ -287,8 +289,13 @@ for chunk_idx, chunk in enumerate(chunks):
                 transcription_parts.append(token_text)
     
     transcription = "".join(transcription_parts)
-    print(f"Full transcription with timestamps (overlap removed): {transcription}")
-    transcriptions.append(transcription)
+    print(f"Chunk {chunk_idx + 1} output length: {len(transcription)} chars")
+    print(f"Full transcription with timestamps (overlap removed): {transcription[:200]}...")  # First 200 chars
+    
+    if transcription:  # Only add non-empty transcriptions
+        transcriptions.append(transcription)
+    else:
+        print(f"WARNING: Chunk {chunk_idx + 1} produced empty transcription!")
 
 print(f"Elapsed inf2: {time.time()-t}")
 
