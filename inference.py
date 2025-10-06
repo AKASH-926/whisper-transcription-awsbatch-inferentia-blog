@@ -183,15 +183,44 @@ chunk_size = 30*16000 # 30 seconds * 16000 samples / second
 chunks = waveform.split(chunk_size, dim=1)
 
 import time
+
+# Check if the model has the right configuration for timestamps
+# Timestamp tokens in Whisper tokenizer typically start at token ID 50364
+timestamp_begin = processor.tokenizer.timestamp_begin
+print(f"Timestamp begin token ID: {timestamp_begin}")
+print(f"Model generation config: {model.generation_config}")
+
+# Ensure timestamps are not suppressed in generation
+if hasattr(model.generation_config, 'suppress_tokens'):
+    print(f"Suppressed tokens before: {model.generation_config.suppress_tokens}")
+    # Remove timestamp tokens from suppression list if they're there
+    if model.generation_config.suppress_tokens is not None:
+        model.generation_config.suppress_tokens = [t for t in model.generation_config.suppress_tokens if t < timestamp_begin]
+        print(f"Suppressed tokens after: {model.generation_config.suppress_tokens}")
+
 t=time.time()
 
 transcriptions = []
 for chunk in chunks:
     inputs = processor(chunk.squeeze().numpy(), sampling_rate=16000, return_tensors="pt")
     with torch.no_grad():
-        predicted_ids = model.generate(inputs.input_features, return_timestamps=True)
-    transcription = processor.decode(predicted_ids[0], skip_special_tokens=False)
-    print(transcription)
+        # Force timestamp generation by not suppressing timestamp tokens
+        # and explicitly setting max_new_tokens
+        predicted_ids = model.generate(
+            inputs.input_features,
+            return_timestamps=True,
+            max_new_tokens=448,
+            num_beams=1,
+            language="en",
+            task="transcribe"
+        )
+    
+    # Debug: print the actual token IDs
+    print(f"Predicted token IDs: {predicted_ids[0][:50]}")  # First 50 tokens
+    
+    # Decode with timestamps
+    transcription = processor.batch_decode(predicted_ids, skip_special_tokens=False)[0]
+    print(f"Full transcription with tokens: {transcription}")
     transcriptions.append(transcription)
 
 print(f"Elapsed inf2: {time.time()-t}")
