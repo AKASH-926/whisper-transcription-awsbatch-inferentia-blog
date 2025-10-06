@@ -178,9 +178,27 @@ if waveform.shape[0] > 1:
 if sample_rate != 16000:
     waveform = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)(waveform)
 
-# chunk the audio
-chunk_size = 30*16000 # 30 seconds * 16000 samples / second
-chunks = waveform.split(chunk_size, dim=1)
+# Chunk the audio with overlap to avoid cutting sentences
+chunk_size = 30 * 16000  # 30 seconds * 16000 samples / second
+overlap_size = 5 * 16000  # 5 seconds overlap to capture sentence boundaries
+
+# Create overlapping chunks
+chunks = []
+audio_length = waveform.shape[1]
+start = 0
+
+while start < audio_length:
+    end = min(start + chunk_size, audio_length)
+    chunk = waveform[:, start:end]
+    chunks.append(chunk)
+    
+    # Move to next chunk with overlap (except for the last chunk)
+    if end < audio_length:
+        start += chunk_size - overlap_size
+    else:
+        break
+
+print(f"Created {len(chunks)} chunks with 5-second overlap")
 
 import time
 
@@ -209,9 +227,12 @@ if hasattr(model.generation_config, 'suppress_tokens'):
 t=time.time()
 
 transcriptions = []
+previous_text = ""  # Track last bit of text to detect duplicates in overlap
+
 for chunk_idx, chunk in enumerate(chunks):
-    # Calculate time offset for this chunk (each chunk is 30 seconds)
-    chunk_offset = chunk_idx * 30.0
+    # Calculate time offset for this chunk
+    # Since chunks overlap by 5 seconds, each chunk starts 25 seconds after the previous
+    chunk_offset = chunk_idx * 25.0  # (30 - 5 seconds overlap)
     print(f"\nProcessing chunk {chunk_idx + 1}/{len(chunks)}, offset: {chunk_offset}s")
     
     inputs = processor(chunk.squeeze().numpy(), sampling_rate=16000, return_tensors="pt")
@@ -243,19 +264,30 @@ for chunk_idx, chunk in enumerate(chunks):
             # So: time = (token_id - timestamp_begin) * 0.02
             # Add chunk_offset to make timestamps continuous across the entire audio
             time_seconds = (token_id - timestamp_begin) * 0.02 + chunk_offset
+            
+            # Skip timestamps in the overlap region for non-first chunks
+            # Keep only timestamps >= chunk_offset + 5 seconds (after overlap)
+            if chunk_idx > 0 and time_seconds < chunk_offset + 5.0:
+                continue  # Skip this timestamp and associated text (it's in the overlap)
+            
             transcription_parts.append(f"<|{time_seconds:.2f}|>")
             last_timestamp = time_seconds
         elif nospeech_token_id and token_id in nospeech_token_id:
             # Detected silence/no-speech segment
-            transcription_parts.append("<|nospeech|>")
+            if chunk_idx == 0 or last_timestamp >= chunk_offset + 5.0:
+                transcription_parts.append("<|nospeech|>")
         else:
             # Decode regular token
+            # Skip text in overlap region (first 5 seconds of non-first chunks)
+            if chunk_idx > 0 and last_timestamp < chunk_offset + 5.0:
+                continue  # Skip text in overlap region
+            
             token_text = processor.tokenizer.decode([token_id], skip_special_tokens=False)
             if token_text:
                 transcription_parts.append(token_text)
     
     transcription = "".join(transcription_parts)
-    print(f"Full transcription with timestamps: {transcription}")
+    print(f"Full transcription with timestamps (overlap removed): {transcription}")
     transcriptions.append(transcription)
 
 print(f"Elapsed inf2: {time.time()-t}")
