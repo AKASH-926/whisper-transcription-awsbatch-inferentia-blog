@@ -29,7 +29,7 @@ input_features = processor(sample["array"], sampling_rate=sample["sampling_rate"
 batch_size=1
 # output_attentions is required if you want to return word timestamps
 # if you don't need timestamps, just set this to False and get some better latency
-output_attentions=False
+output_attentions=True
 # this is the maximum number of tokens the model will be able to decode
 # for the sample #3 we selected above, this is enough. If you're planning to 
 # process larger samples, you need to adjust it accordinly.
@@ -120,7 +120,7 @@ model.model.decoder.max_length = max_dec_len
 model.proj_out.max_length = max_dec_len
 
 # warmup model
-y1 = model.generate(input_features)
+y1 = model.generate(input_features, return_timestamps=True)
 
 # Trace Encoder
 import os
@@ -184,16 +184,16 @@ else:
 # Test
 
 # warmup inf2 model
-y1 = model.generate(input_features)
+y1 = model.generate(input_features, return_timestamps=True)
 
 torch.set_num_threads(1)
 
 import time
 t=time.time()
-y1 = model.generate(input_features)
+y1 = model.generate(input_features, return_timestamps=True)
 print(f"Elapsed inf2: {time.time()-t}")
-t=time.time()
-y2 = cpu_model.generate(input_features)
+t=time.time()   #
+y2 = cpu_model.generate(input_features, return_timestamps=True)
 print(f"Elapsed cpu: {time.time()-t}")
 print(f"Tokens inf2: {y1}")
 print(f"Tokens cpu: {y2}")
