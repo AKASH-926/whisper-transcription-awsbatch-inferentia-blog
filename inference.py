@@ -186,7 +186,7 @@ import time
 
 # Check if the model has the right configuration for timestamps
 # Get timestamp token IDs from the tokenizer
-timestamp_ids = processor.tokenizer.timestamp_ids()
+timestamp_ids = list(processor.tokenizer.timestamp_ids())
 timestamp_begin = min(timestamp_ids) if timestamp_ids else 50364
 print(f"Timestamp token IDs: {timestamp_ids[:10]}... (showing first 10)")
 print(f"Timestamp begin token ID: {timestamp_begin}")
