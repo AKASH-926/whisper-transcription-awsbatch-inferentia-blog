@@ -192,11 +192,17 @@ print(f"Timestamp token IDs: {timestamp_ids[:10]}... (showing first 10)")
 print(f"Timestamp begin token ID: {timestamp_begin}")
 print(f"Model generation config: {model.generation_config}")
 
-# Ensure timestamps are not suppressed in generation
+# Get special token IDs for silence/no-speech detection
+nospeech_token_id = processor.tokenizer.encode("<|nospeech|>", add_special_tokens=False)
+print(f"No speech token ID: {nospeech_token_id}")
+
+# Ensure timestamps and nospeech tokens are not suppressed in generation
 if hasattr(model.generation_config, 'suppress_tokens'):
     print(f"Suppressed tokens before: {model.generation_config.suppress_tokens}")
     # Remove timestamp tokens from suppression list if they're there
     if model.generation_config.suppress_tokens is not None:
+        # Keep all non-timestamp tokens in suppression, but allow timestamps and nospeech
+        # Note: We keep nospeech suppressed by default as Whisper rarely uses it effectively
         model.generation_config.suppress_tokens = [t for t in model.generation_config.suppress_tokens if t < timestamp_begin]
         print(f"Suppressed tokens after: {model.generation_config.suppress_tokens}")
 
@@ -228,6 +234,7 @@ for chunk_idx, chunk in enumerate(chunks):
     # Convert token IDs to text, preserving timestamp tokens
     tokens = predicted_ids[0].tolist()
     transcription_parts = []
+    last_timestamp = 0.0
     
     for token_id in tokens:
         if token_id in timestamp_ids:
@@ -237,6 +244,10 @@ for chunk_idx, chunk in enumerate(chunks):
             # Add chunk_offset to make timestamps continuous across the entire audio
             time_seconds = (token_id - timestamp_begin) * 0.02 + chunk_offset
             transcription_parts.append(f"<|{time_seconds:.2f}|>")
+            last_timestamp = time_seconds
+        elif nospeech_token_id and token_id in nospeech_token_id:
+            # Detected silence/no-speech segment
+            transcription_parts.append("<|nospeech|>")
         else:
             # Decode regular token
             token_text = processor.tokenizer.decode([token_id], skip_special_tokens=False)
