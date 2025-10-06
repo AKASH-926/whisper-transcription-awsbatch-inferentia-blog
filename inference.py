@@ -264,9 +264,86 @@ print(f"Elapsed inf2: {time.time()-t}")
 full_transcription = " ".join(transcriptions)
 #print("Full Transcription:", full_transcription)
 
+# Save TXT file
 output_filename = audio_path + '.txt'
 file = open(output_filename, 'w')
 file.write(full_transcription)
 file.close()
 
+# Upload TXT to S3
 s3_client.put_object(Body=full_transcription, Bucket=output_bucket_name, Key=output_file_prefix + output_filename)
+
+# Generate SRT subtitle file
+import re
+
+def generate_srt(transcription_text):
+    """Convert timestamped transcription to SRT format"""
+    srt_entries = []
+    entry_number = 1
+    
+    # Remove control tokens
+    text = transcription_text.replace('<|startoftranscript|>', '')
+    text = text.replace('<|en|>', '')
+    text = text.replace('<|transcribe|>', '')
+    text = text.replace('<|endoftext|>', '')
+    
+    # Extract timestamps and text using regex
+    # Pattern: <|time|> text <|time|>
+    pattern = r'<\|(\d+\.\d+)\|>([^<]*?)(?=<\||\Z)'
+    matches = re.findall(pattern, text)
+    
+    # Create SRT entries by pairing consecutive timestamps
+    for i in range(len(matches) - 1):
+        start_time = float(matches[i][0])
+        text_content = matches[i][1].strip()
+        
+        # Skip empty text
+        if not text_content:
+            continue
+            
+        # Get end time from next timestamp
+        end_time = float(matches[i + 1][0])
+        
+        # Convert seconds to SRT time format (HH:MM:SS,mmm)
+        def seconds_to_srt_time(seconds):
+            hours = int(seconds // 3600)
+            minutes = int((seconds % 3600) // 60)
+            secs = int(seconds % 60)
+            millis = int((seconds % 1) * 1000)
+            return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+        
+        start_time_str = seconds_to_srt_time(start_time)
+        end_time_str = seconds_to_srt_time(end_time)
+        
+        # Create SRT entry
+        srt_entry = f"{entry_number}\n{start_time_str} --> {end_time_str}\n{text_content}\n"
+        srt_entries.append(srt_entry)
+        entry_number += 1
+    
+    # Handle last segment (if there's text after the last timestamp)
+    if matches and matches[-1][1].strip():
+        start_time = float(matches[-1][0])
+        text_content = matches[-1][1].strip()
+        # Estimate end time as start + 3 seconds (or use audio duration if available)
+        end_time = start_time + 3.0
+        
+        start_time_str = seconds_to_srt_time(start_time)
+        end_time_str = seconds_to_srt_time(end_time)
+        
+        srt_entry = f"{entry_number}\n{start_time_str} --> {end_time_str}\n{text_content}\n"
+        srt_entries.append(srt_entry)
+    
+    return "\n".join(srt_entries)
+
+# Generate SRT content
+srt_content = generate_srt(full_transcription)
+print(f"\nGenerated SRT with {len(srt_content.split('\\n\\n'))} subtitle entries")
+
+# Save SRT file
+srt_filename = audio_path + '.srt'
+with open(srt_filename, 'w', encoding='utf-8') as srt_file:
+    srt_file.write(srt_content)
+
+# Upload SRT to S3
+s3_client.put_object(Body=srt_content.encode('utf-8'), Bucket=output_bucket_name, Key=output_file_prefix + srt_filename)
+print(f"Uploaded SRT file to S3: {output_file_prefix + srt_filename}")
