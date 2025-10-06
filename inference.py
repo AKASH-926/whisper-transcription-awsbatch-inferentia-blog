@@ -203,7 +203,11 @@ if hasattr(model.generation_config, 'suppress_tokens'):
 t=time.time()
 
 transcriptions = []
-for chunk in chunks:
+for chunk_idx, chunk in enumerate(chunks):
+    # Calculate time offset for this chunk (each chunk is 30 seconds)
+    chunk_offset = chunk_idx * 30.0
+    print(f"\nProcessing chunk {chunk_idx + 1}/{len(chunks)}, offset: {chunk_offset}s")
+    
     inputs = processor(chunk.squeeze().numpy(), sampling_rate=16000, return_tensors="pt")
     with torch.no_grad():
         # Force timestamp generation by not suppressing timestamp tokens
@@ -230,7 +234,8 @@ for chunk in chunks:
             # Convert timestamp token ID to time in seconds
             # Whisper timestamp tokens start at timestamp_begin and each represents 0.02 second intervals
             # So: time = (token_id - timestamp_begin) * 0.02
-            time_seconds = (token_id - timestamp_begin) * 0.02
+            # Add chunk_offset to make timestamps continuous across the entire audio
+            time_seconds = (token_id - timestamp_begin) * 0.02 + chunk_offset
             transcription_parts.append(f"<|{time_seconds:.2f}|>")
         else:
             # Decode regular token
