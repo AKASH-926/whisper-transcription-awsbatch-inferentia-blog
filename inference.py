@@ -337,7 +337,9 @@ def generate_srt(transcription_text):
 
 # Generate SRT content
 srt_content = generate_srt(full_transcription)
-print(f"\nGenerated SRT with {len(srt_content.split('\\n\\n'))} subtitle entries")
+# Count subtitle entries (each entry is separated by blank lines)
+num_entries = len([line for line in srt_content.split('\n') if line.strip().isdigit()])
+print(f"\nGenerated SRT with {num_entries} subtitle entries")
 
 # Save SRT file
 srt_filename = audio_path + '.srt'
