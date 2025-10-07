@@ -261,27 +261,139 @@ if sample_rate != 16000:
     print(f"Resampling from {sample_rate}Hz to 16000Hz")
     waveform = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)(waveform)
 
-# Chunk the audio with overlap to avoid cutting sentences
-chunk_size = 30 * 16000  # 30 seconds * 16000 samples / second
-overlap_size = 5 * 16000  # 5 seconds overlap to capture sentence boundaries
-
-# Create overlapping chunks
-chunks = []
-audio_length = waveform.shape[1]
-start = 0
-
-while start < audio_length:
-    end = min(start + chunk_size, audio_length)
-    chunk = waveform[:, start:end]
-    chunks.append(chunk)
+# Smart chunking using VAD (Voice Activity Detection)
+# This approach detects natural silence points to avoid cutting words
+def create_vad_chunks(waveform, max_chunk_duration=30, min_silence_duration=0.5):
+    """
+    Create audio chunks at natural silence points using energy-based VAD.
     
-    # Move to next chunk with overlap (except for the last chunk)
-    if end < audio_length:
-        start += chunk_size - overlap_size
+    Args:
+        waveform: Audio tensor (1, num_samples)
+        max_chunk_duration: Maximum chunk duration in seconds
+        min_silence_duration: Minimum silence duration to consider as a split point
+    
+    Returns:
+        List of tuples: [(start_sample, end_sample, start_time, end_time), ...]
+    """
+    sample_rate = 16000
+    audio = waveform.squeeze().numpy()
+    
+    # Calculate energy in sliding windows
+    window_size = int(0.02 * sample_rate)  # 20ms windows
+    hop_size = int(0.01 * sample_rate)  # 10ms hop
+    
+    # Calculate RMS energy for each window
+    energies = []
+    for i in range(0, len(audio) - window_size, hop_size):
+        window = audio[i:i + window_size]
+        energy = np.sqrt(np.mean(window ** 2))
+        energies.append(energy)
+    
+    energies = np.array(energies)
+    
+    # Determine silence threshold (adaptive based on audio characteristics)
+    # Use percentile to handle different audio levels
+    if len(energies) > 0:
+        threshold = np.percentile(energies, 20)  # Bottom 20% is considered silence
+        # Ensure threshold is not too low
+        threshold = max(threshold, 0.01)
     else:
-        break
+        threshold = 0.01
+    
+    print(f"VAD threshold: {threshold:.4f}, Max energy: {np.max(energies):.4f}")
+    
+    # Find silence regions
+    is_silence = energies < threshold
+    min_silence_samples = int(min_silence_duration * sample_rate / hop_size)
+    
+    # Find continuous silence regions
+    silence_regions = []
+    in_silence = False
+    silence_start = 0
+    
+    for i, silent in enumerate(is_silence):
+        if silent and not in_silence:
+            # Start of silence
+            in_silence = True
+            silence_start = i
+        elif not silent and in_silence:
+            # End of silence
+            silence_duration = i - silence_start
+            if silence_duration >= min_silence_samples:
+                # Convert to sample indices (middle of silence region)
+                sample_idx = (silence_start + i) // 2 * hop_size
+                silence_regions.append(sample_idx)
+            in_silence = False
+    
+    print(f"Found {len(silence_regions)} silence points")
+    
+    # Create chunks based on silence points
+    chunks = []
+    max_chunk_samples = int(max_chunk_duration * sample_rate)
+    audio_length = len(audio)
+    
+    chunk_start = 0
+    last_good_split = 0
+    
+    for silence_point in silence_regions:
+        # Check if adding this silence point would create a chunk within max duration
+        if silence_point - chunk_start <= max_chunk_samples:
+            last_good_split = silence_point
+        else:
+            # We've exceeded max duration, use the last good split point
+            if last_good_split > chunk_start:
+                chunks.append((
+                    chunk_start,
+                    last_good_split,
+                    chunk_start / sample_rate,
+                    last_good_split / sample_rate
+                ))
+                chunk_start = last_good_split
+                last_good_split = silence_point
+            else:
+                # No good split point found, force split at max duration
+                force_split = chunk_start + max_chunk_samples
+                chunks.append((
+                    chunk_start,
+                    force_split,
+                    chunk_start / sample_rate,
+                    force_split / sample_rate
+                ))
+                chunk_start = force_split
+                last_good_split = silence_point if silence_point > force_split else 0
+    
+    # Add the final chunk
+    if chunk_start < audio_length:
+        chunks.append((
+            chunk_start,
+            audio_length,
+            chunk_start / sample_rate,
+            audio_length / sample_rate
+        ))
+    
+    # If no chunks were created (very short audio or no silence), create one chunk
+    if not chunks:
+        chunks.append((
+            0,
+            audio_length,
+            0.0,
+            audio_length / sample_rate
+        ))
+    
+    return chunks
 
-print(f"Created {len(chunks)} chunks with 5-second overlap")
+# Create chunks at natural silence points
+chunk_info = create_vad_chunks(waveform, max_chunk_duration=30, min_silence_duration=0.5)
+print(f"Created {len(chunk_info)} chunks at natural silence points:")
+for i, (start_sample, end_sample, start_time, end_time) in enumerate(chunk_info):
+    duration = end_time - start_time
+    print(f"  Chunk {i+1}: {start_time:.2f}s - {end_time:.2f}s (duration: {duration:.2f}s)")
+
+# Extract actual audio chunks
+chunks = []
+for start_sample, end_sample, _, _ in chunk_info:
+    chunk = waveform[:, start_sample:end_sample]
+    chunks.append(chunk)
 
 import time
 
@@ -310,13 +422,12 @@ if hasattr(model.generation_config, 'suppress_tokens'):
 t=time.time()
 
 transcriptions = []
-previous_text = ""  # Track last bit of text to detect duplicates in overlap
 
-for chunk_idx, chunk in enumerate(chunks):
-    # Calculate time offset for this chunk
-    # Since chunks overlap by 5 seconds, each chunk starts 25 seconds after the previous
-    chunk_offset = chunk_idx * 25.0  # (30 - 5 seconds overlap)
-    print(f"\nProcessing chunk {chunk_idx + 1}/{len(chunks)}, offset: {chunk_offset}s")
+for chunk_idx, (chunk, chunk_data) in enumerate(zip(chunks, chunk_info)):
+    start_sample, end_sample, start_time, end_time = chunk_data
+    chunk_duration = end_time - start_time
+    print(f"\nProcessing chunk {chunk_idx + 1}/{len(chunks)}")
+    print(f"  Time range: {start_time:.2f}s - {end_time:.2f}s (duration: {chunk_duration:.2f}s)")
     
     inputs = processor(chunk.squeeze().numpy(), sampling_rate=16000, return_tensors="pt")
     with torch.no_grad():
@@ -331,48 +442,32 @@ for chunk_idx, chunk in enumerate(chunks):
         )
     
     # Debug: print the actual token IDs
-    print(f"Predicted token IDs: {predicted_ids[0][:50]}")  # First 50 tokens
+    print(f"Predicted token IDs (first 50): {predicted_ids[0][:50]}")
     
     # Manually build transcription with timestamps
     # Convert token IDs to text, preserving timestamp tokens
     tokens = predicted_ids[0].tolist()
     transcription_parts = []
-    last_timestamp = 0.0
     
     for token_id in tokens:
         if token_id in timestamp_ids:
             # Convert timestamp token ID to time in seconds
             # Whisper timestamp tokens start at timestamp_begin and each represents 0.02 second intervals
-            # So: time = (token_id - timestamp_begin) * 0.02
-            # Add chunk_offset to make timestamps continuous across the entire audio
-            time_seconds = (token_id - timestamp_begin) * 0.02 + chunk_offset
-            
-            # Always update last_timestamp to track where we are in the audio
-            last_timestamp = time_seconds
-            
-            # Skip timestamps in the overlap region for non-first chunks
-            # Keep only timestamps >= chunk_offset + 5 seconds (after overlap)
-            if chunk_idx > 0 and time_seconds < chunk_offset + 5.0:
-                continue  # Skip this timestamp token from output (but timestamp was tracked above)
-            
+            # Add start_time to make timestamps relative to the full audio
+            time_seconds = (token_id - timestamp_begin) * 0.02 + start_time
             transcription_parts.append(f"<|{time_seconds:.2f}|>")
         elif nospeech_token_id and token_id in nospeech_token_id:
             # Detected silence/no-speech segment
-            if chunk_idx == 0 or last_timestamp >= chunk_offset + 5.0:
-                transcription_parts.append("<|nospeech|>")
+            transcription_parts.append("<|nospeech|>")
         else:
             # Decode regular token
-            # Skip text in overlap region (first 5 seconds of non-first chunks)
-            if chunk_idx > 0 and last_timestamp < chunk_offset + 5.0:
-                continue  # Skip text in overlap region
-            
             token_text = processor.tokenizer.decode([token_id], skip_special_tokens=False)
             if token_text:
                 transcription_parts.append(token_text)
     
     transcription = "".join(transcription_parts)
     print(f"Chunk {chunk_idx + 1} output length: {len(transcription)} chars")
-    print(f"Full transcription with timestamps (overlap removed): {transcription[:200]}...")  # First 200 chars
+    print(f"Sample output: {transcription[:200]}...")  # First 200 chars
     
     if transcription:  # Only add non-empty transcriptions
         transcriptions.append(transcription)
