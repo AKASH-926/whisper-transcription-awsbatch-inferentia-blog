@@ -327,8 +327,7 @@ for chunk_idx, chunk in enumerate(chunks):
             return_timestamps=True,
             max_new_tokens=448,
             num_beams=1,
-            language="en",
-            task="transcribe"
+            task="translate"
         )
     
     # Debug: print the actual token IDs
