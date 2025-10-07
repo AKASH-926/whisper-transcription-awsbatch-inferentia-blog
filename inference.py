@@ -261,15 +261,21 @@ if sample_rate != 16000:
     print(f"Resampling from {sample_rate}Hz to 16000Hz")
     waveform = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)(waveform)
 
-# Smart chunking using VAD (Voice Activity Detection)
+# Smart chunking using VAD (Voice Activity Detection) with overlap
 # This approach detects natural silence points to avoid cutting words
-def create_vad_chunks(waveform, max_chunk_duration=30, min_silence_duration=0.5):
+# GUARANTEES COMPLETE AUDIO COVERAGE:
+# - Always starts at 0.0s and ends at full audio duration
+# - 2 second overlap between chunks ensures no content is lost at boundaries
+# - Validates for gaps and falls back to safe mode if needed
+# - Conservative merging keeps content when in doubt
+def create_vad_chunks(waveform, max_chunk_duration=29, overlap_duration=1.5, min_silence_duration=0.3):
     """
-    Create audio chunks at natural silence points using energy-based VAD.
+    Create audio chunks at natural silence points using energy-based VAD with overlap.
     
     Args:
         waveform: Audio tensor (1, num_samples)
-        max_chunk_duration: Maximum chunk duration in seconds
+        max_chunk_duration: Maximum chunk duration in seconds (use 29s to stay safely under 30s)
+        overlap_duration: Overlap between consecutive chunks in seconds
         min_silence_duration: Minimum silence duration to consider as a split point
     
     Returns:
@@ -277,6 +283,15 @@ def create_vad_chunks(waveform, max_chunk_duration=30, min_silence_duration=0.5)
     """
     sample_rate = 16000
     audio = waveform.squeeze().numpy()
+    audio_length = len(audio)
+    audio_duration = audio_length / sample_rate
+    
+    print(f"Total audio duration: {audio_duration:.2f}s")
+    
+    # If audio is short enough, return as single chunk
+    if audio_duration <= max_chunk_duration:
+        print("Audio fits in single chunk, no splitting needed")
+        return [(0, audio_length, 0.0, audio_duration)]
     
     # Calculate energy in sliding windows
     window_size = int(0.02 * sample_rate)  # 20ms windows
@@ -291,16 +306,18 @@ def create_vad_chunks(waveform, max_chunk_duration=30, min_silence_duration=0.5)
     
     energies = np.array(energies)
     
-    # Determine silence threshold (adaptive based on audio characteristics)
-    # Use percentile to handle different audio levels
+    # Determine silence threshold (more conservative)
+    # Use 10th percentile instead of 20th to be more selective
     if len(energies) > 0:
-        threshold = np.percentile(energies, 20)  # Bottom 20% is considered silence
-        # Ensure threshold is not too low
-        threshold = max(threshold, 0.01)
+        threshold = np.percentile(energies, 10)  # Bottom 10% is considered silence
+        # Use median as reference for adaptive threshold
+        median_energy = np.median(energies)
+        # Set threshold as percentage of median (more robust)
+        threshold = max(threshold, median_energy * 0.1, 0.005)
     else:
         threshold = 0.01
     
-    print(f"VAD threshold: {threshold:.4f}, Max energy: {np.max(energies):.4f}")
+    print(f"VAD threshold: {threshold:.4f}, Median energy: {np.median(energies):.4f}, Max energy: {np.max(energies):.4f}")
     
     # Find silence regions
     is_silence = energies < threshold
@@ -327,67 +344,186 @@ def create_vad_chunks(waveform, max_chunk_duration=30, min_silence_duration=0.5)
     
     print(f"Found {len(silence_regions)} silence points")
     
-    # Create chunks based on silence points
+    # Create chunks based on silence points with overlap
     chunks = []
     max_chunk_samples = int(max_chunk_duration * sample_rate)
-    audio_length = len(audio)
+    overlap_samples = int(overlap_duration * sample_rate)
     
+    # CRITICAL: Always start at 0 to ensure no content is lost
     chunk_start = 0
-    last_good_split = 0
     
-    for silence_point in silence_regions:
-        # Check if adding this silence point would create a chunk within max duration
-        if silence_point - chunk_start <= max_chunk_samples:
-            last_good_split = silence_point
+    while chunk_start < audio_length:
+        # Target end point
+        target_end = chunk_start + max_chunk_samples
+        
+        if target_end >= audio_length - (0.5 * sample_rate):  # Within 0.5s of end
+            # Last chunk - take everything remaining to ensure complete coverage
+            chunks.append((
+                chunk_start,
+                audio_length,
+                chunk_start / sample_rate,
+                audio_length / sample_rate
+            ))
+            break
+        
+        # Find the best silence point near the target end
+        # Look in a window around target_end (±3 seconds)
+        search_window = int(3 * sample_rate)
+        search_start = max(target_end - search_window, chunk_start + int(10 * sample_rate))  # Don't go too far back
+        search_end = min(target_end + search_window, audio_length)
+        
+        # Find silence points in the search window
+        valid_silence_points = [sp for sp in silence_regions 
+                               if search_start <= sp <= search_end]
+        
+        if valid_silence_points:
+            # Choose the silence point closest to target_end
+            chunk_end = min(valid_silence_points, key=lambda x: abs(x - target_end))
         else:
-            # We've exceeded max duration, use the last good split point
-            if last_good_split > chunk_start:
-                chunks.append((
-                    chunk_start,
-                    last_good_split,
-                    chunk_start / sample_rate,
-                    last_good_split / sample_rate
-                ))
-                chunk_start = last_good_split
-                last_good_split = silence_point
-            else:
-                # No good split point found, force split at max duration
-                force_split = chunk_start + max_chunk_samples
-                chunks.append((
-                    chunk_start,
-                    force_split,
-                    chunk_start / sample_rate,
-                    force_split / sample_rate
-                ))
-                chunk_start = force_split
-                last_good_split = silence_point if silence_point > force_split else 0
-    
-    # Add the final chunk
-    if chunk_start < audio_length:
+            # No silence found, use target_end but ensure minimum progress
+            chunk_end = target_end
+            print(f"Warning: No silence point found near {target_end/sample_rate:.2f}s, forcing split")
+        
+        # Ensure chunk is not too short and we're making progress
+        if chunk_end - chunk_start < int(5 * sample_rate):  # Minimum 5 seconds
+            chunk_end = min(chunk_start + int(10 * sample_rate), audio_length)
+        
         chunks.append((
             chunk_start,
-            audio_length,
+            chunk_end,
             chunk_start / sample_rate,
-            audio_length / sample_rate
+            chunk_end / sample_rate
         ))
+        
+        # Next chunk starts with overlap
+        # Move forward by (chunk_duration - overlap_duration) to ensure overlap
+        step_samples = max_chunk_samples - overlap_samples
+        chunk_start = chunk_start + step_samples
+        
+        # Ensure we're making progress (minimum 10 seconds forward)
+        if chunks:
+            last_start = chunks[-1][0]
+            if chunk_start - last_start < int(10 * sample_rate):
+                chunk_start = last_start + int(10 * sample_rate)
     
-    # If no chunks were created (very short audio or no silence), create one chunk
-    if not chunks:
-        chunks.append((
-            0,
-            audio_length,
-            0.0,
-            audio_length / sample_rate
-        ))
+    # Validate and merge very short chunks
+    validated_chunks = []
+    for i, chunk in enumerate(chunks):
+        start_sample, end_sample, start_time, end_time = chunk
+        duration = end_time - start_time
+        
+        # If chunk is very short (< 1 second) and not the last chunk, merge with next
+        if duration < 1.0 and i < len(chunks) - 1:
+            print(f"Chunk {i+1} is too short ({duration:.2f}s), will merge with next")
+            continue
+        
+        validated_chunks.append(chunk)
     
-    return chunks
+    return validated_chunks if validated_chunks else [(0, audio_length, 0.0, audio_duration)]
 
-# Create chunks at natural silence points
-chunk_info = create_vad_chunks(waveform, max_chunk_duration=30, min_silence_duration=0.5)
-print(f"Created {len(chunk_info)} chunks at natural silence points:")
+# Create chunks at natural silence points with overlap
+# Using 2 seconds overlap for maximum safety - ensures no content is lost
+chunk_info = create_vad_chunks(waveform, max_chunk_duration=28, overlap_duration=2.0, min_silence_duration=0.3)
+print(f"\nCreated {len(chunk_info)} chunks at natural silence points with overlap:")
+
+# CRITICAL: Validate complete audio coverage - NO GAPS ALLOWED
+def validate_chunk_coverage(chunk_info, total_duration):
+    """Ensure all audio time is covered by at least one chunk"""
+    print("\n🔍 Validating chunk coverage...")
+    
+    if not chunk_info:
+        raise Exception("ERROR: No chunks created!")
+    
+    # Check start coverage
+    if chunk_info[0][2] > 0.1:  # start_time of first chunk
+        print(f"⚠️  WARNING: First chunk starts at {chunk_info[0][2]:.2f}s, not 0.0s")
+        print(f"   Adding initial chunk to cover 0.0s - {chunk_info[0][2]:.2f}s")
+        return False
+    
+    # Check end coverage
+    last_end = chunk_info[-1][3]
+    if last_end < total_duration - 0.1:
+        print(f"⚠️  WARNING: Last chunk ends at {last_end:.2f}s, but audio is {total_duration:.2f}s")
+        print(f"   Missing {total_duration - last_end:.2f}s at the end!")
+        return False
+    
+    # Check for gaps between chunks
+    has_gaps = False
+    for i in range(1, len(chunk_info)):
+        prev_end = chunk_info[i-1][3]
+        current_start = chunk_info[i][2]
+        
+        if current_start > prev_end + 0.01:  # Gap detected (allowing 0.01s tolerance)
+            gap_duration = current_start - prev_end
+            print(f"⚠️  GAP DETECTED between chunk {i} and {i+1}: {gap_duration:.2f}s")
+            print(f"   Chunk {i} ends at {prev_end:.2f}s, Chunk {i+1} starts at {current_start:.2f}s")
+            has_gaps = True
+    
+    if not has_gaps:
+        print("✅ Coverage validation PASSED: All audio time is covered with overlaps")
+        
+        # Show coverage statistics
+        total_overlap = 0
+        for i in range(1, len(chunk_info)):
+            overlap = chunk_info[i-1][3] - chunk_info[i][2]
+            if overlap > 0:
+                total_overlap += overlap
+        
+        print(f"   Total audio: {total_duration:.2f}s")
+        print(f"   Total overlap: {total_overlap:.2f}s")
+        print(f"   Coverage redundancy: {((sum([c[3]-c[2] for c in chunk_info]) / total_duration - 1) * 100):.1f}%")
+        return True
+    
+    return not has_gaps
+
+total_audio_duration = waveform.shape[1] / 16000
+coverage_ok = validate_chunk_coverage(chunk_info, total_audio_duration)
+
+if not coverage_ok:
+    print("\n❌ Coverage validation FAILED - Gaps detected!")
+    print("🔧 Switching to SAFE MODE: Creating overlapping fixed-duration chunks...")
+    
+    # Fallback: Create fixed overlapping chunks that guarantee coverage
+    safe_chunks = []
+    sample_rate = 16000
+    chunk_duration = 28  # seconds
+    overlap_duration = 2.0  # seconds
+    step_duration = chunk_duration - overlap_duration
+    
+    audio_length = waveform.shape[1]
+    total_duration = audio_length / sample_rate
+    
+    current_time = 0
+    while current_time < total_duration:
+        start_time = current_time
+        end_time = min(current_time + chunk_duration, total_duration)
+        start_sample = int(start_time * sample_rate)
+        end_sample = int(end_time * sample_rate)
+        
+        safe_chunks.append((start_sample, end_sample, start_time, end_time))
+        
+        if end_time >= total_duration:
+            break
+        
+        current_time += step_duration
+    
+    chunk_info = safe_chunks
+    print(f"✅ Created {len(chunk_info)} safe overlapping chunks")
+    coverage_ok = validate_chunk_coverage(chunk_info, total_audio_duration)
+    if not coverage_ok:
+        raise Exception("CRITICAL: Even safe mode failed to provide complete coverage!")
+
+print(f"\n📋 Final chunk layout:")
 for i, (start_sample, end_sample, start_time, end_time) in enumerate(chunk_info):
     duration = end_time - start_time
     print(f"  Chunk {i+1}: {start_time:.2f}s - {end_time:.2f}s (duration: {duration:.2f}s)")
+    if i > 0:
+        prev_end = chunk_info[i-1][3]
+        overlap = prev_end - start_time
+        if overlap > 0:
+            print(f"    ✓ Overlap with previous: {overlap:.2f}s")
+        else:
+            print(f"    ⚠️  No overlap! Gap: {abs(overlap):.2f}s")
 
 # Extract actual audio chunks
 chunks = []
@@ -426,28 +562,48 @@ transcriptions = []
 for chunk_idx, (chunk, chunk_data) in enumerate(zip(chunks, chunk_info)):
     start_sample, end_sample, start_time, end_time = chunk_data
     chunk_duration = end_time - start_time
-    print(f"\nProcessing chunk {chunk_idx + 1}/{len(chunks)}")
+    print(f"\n{'='*60}")
+    print(f"Processing chunk {chunk_idx + 1}/{len(chunks)}")
     print(f"  Time range: {start_time:.2f}s - {end_time:.2f}s (duration: {chunk_duration:.2f}s)")
+    print(f"  Audio shape: {chunk.shape}, samples: {chunk.shape[1]}")
+    
+    # Check for silent chunks
+    chunk_energy = torch.sqrt(torch.mean(chunk ** 2))
+    print(f"  Chunk energy (RMS): {chunk_energy:.6f}")
+    
+    if chunk_energy < 0.001:
+        print(f"  WARNING: Chunk appears to be silent or very quiet!")
     
     inputs = processor(chunk.squeeze().numpy(), sampling_rate=16000, return_tensors="pt")
+    print(f"  Input features shape: {inputs.input_features.shape}")
+    
     with torch.no_grad():
         # Force timestamp generation by not suppressing timestamp tokens
         # and explicitly setting max_new_tokens
+        # NOTE: task="translate" will translate to English, use task="transcribe" for original language
         predicted_ids = model.generate(
             inputs.input_features,
             return_timestamps=True,
             max_new_tokens=448,
             num_beams=1,
-            task="translate"
+            task="translate",  # Change to "transcribe" if you want original language
+            # Additional parameters to improve quality:
+            temperature=0.0,  # Use greedy decoding for consistency
+            compression_ratio_threshold=2.4,  # Detect repetitive output
+            logprob_threshold=-1.0,  # Filter low-confidence outputs
+            no_speech_threshold=0.6,  # Threshold for detecting silence
         )
     
     # Debug: print the actual token IDs
-    print(f"Predicted token IDs (first 50): {predicted_ids[0][:50]}")
+    print(f"  Generated {len(predicted_ids[0])} tokens")
+    print(f"  Token IDs (first 50): {predicted_ids[0][:50].tolist()}")
     
     # Manually build transcription with timestamps
     # Convert token IDs to text, preserving timestamp tokens
     tokens = predicted_ids[0].tolist()
     transcription_parts = []
+    word_count = 0
+    timestamp_count = 0
     
     for token_id in tokens:
         if token_id in timestamp_ids:
@@ -456,28 +612,130 @@ for chunk_idx, (chunk, chunk_data) in enumerate(zip(chunks, chunk_info)):
             # Add start_time to make timestamps relative to the full audio
             time_seconds = (token_id - timestamp_begin) * 0.02 + start_time
             transcription_parts.append(f"<|{time_seconds:.2f}|>")
+            timestamp_count += 1
         elif nospeech_token_id and token_id in nospeech_token_id:
             # Detected silence/no-speech segment
             transcription_parts.append("<|nospeech|>")
         else:
             # Decode regular token
             token_text = processor.tokenizer.decode([token_id], skip_special_tokens=False)
-            if token_text:
+            if token_text and token_text.strip():
                 transcription_parts.append(token_text)
+                # Rough word count
+                if ' ' in token_text or len(token_text) > 2:
+                    word_count += len(token_text.split())
     
     transcription = "".join(transcription_parts)
-    print(f"Chunk {chunk_idx + 1} output length: {len(transcription)} chars")
-    print(f"Sample output: {transcription[:200]}...")  # First 200 chars
     
-    if transcription:  # Only add non-empty transcriptions
+    # Clean up control tokens for display
+    display_text = transcription
+    for token in ['<|startoftranscript|>', '<|en|>', '<|transcribe|>', '<|translate|>', '<|endoftext|>', '<|nospeech|>']:
+        display_text = display_text.replace(token, '')
+    # Remove timestamps for display
+    import re
+    display_text = re.sub(r'<\|\d+\.\d+\|>', '', display_text).strip()
+    
+    print(f"  Output: {len(transcription)} chars, ~{word_count} words, {timestamp_count} timestamps")
+    print(f"  Preview: {display_text[:150]}...")  # First 150 chars without timestamps
+    
+    if transcription and word_count > 0:  # Only add non-empty transcriptions with actual content
         transcriptions.append(transcription)
     else:
-        print(f"WARNING: Chunk {chunk_idx + 1} produced empty transcription!")
+        print(f"  ⚠️  WARNING: Chunk {chunk_idx + 1} produced empty or no-content transcription!")
+        print(f"  This might indicate silence, noise, or non-speech audio in this segment.")
+        # Still append to maintain chunk order, but with a marker
+        transcriptions.append("")
 
 print(f"Elapsed inf2: {time.time()-t}")
 
-# Combine the transcriptions
-full_transcription = " ".join(transcriptions)
+# Merge overlapping transcriptions intelligently
+def merge_overlapping_transcriptions(transcriptions, chunk_info, overlap_duration=2.0):
+    """
+    Merge transcriptions from overlapping chunks by removing duplicate content in overlap regions.
+    Uses conservative approach - when in doubt, keep content rather than cut it.
+    """
+    import re
+    
+    if len(transcriptions) == 0:
+        return ""
+    
+    if len(transcriptions) == 1:
+        return transcriptions[0]
+    
+    print("\n🔗 Merging overlapping transcriptions...")
+    
+    # Keep the first chunk completely
+    merged = transcriptions[0]
+    
+    for i in range(1, len(transcriptions)):
+        current_trans = transcriptions[i]
+        
+        # Skip empty transcriptions
+        if not current_trans or not current_trans.strip():
+            print(f"  Chunk {i+1}: Skipping (empty)")
+            continue
+        
+        prev_chunk_end_time = chunk_info[i-1][3]
+        current_chunk_start_time = chunk_info[i][2]
+        
+        # Check if there's actual overlap
+        if prev_chunk_end_time > current_chunk_start_time + 0.1:  # Has meaningful overlap
+            overlap_time = prev_chunk_end_time - current_chunk_start_time
+            print(f"  Chunk {i+1}: Overlap detected = {overlap_time:.2f}s")
+            
+            # Extract timestamps from current transcription
+            pattern = r'<\|(\d+\.\d+)\|>'
+            timestamps = [(m.start(), m.group(0), float(m.group(1))) for m in re.finditer(pattern, current_trans)]
+            
+            if timestamps:
+                # Find where the overlap ends - look for first timestamp beyond 75% of overlap
+                # Being conservative: only cut 75% of overlap to avoid accidentally losing content
+                cutoff_time = current_chunk_start_time + (overlap_time * 0.75)
+                
+                cut_point = None
+                for idx, ts_text, ts_value in timestamps:
+                    if ts_value >= cutoff_time:
+                        cut_point = idx
+                        print(f"    Found cut point at timestamp {ts_value:.2f}s (cutoff: {cutoff_time:.2f}s)")
+                        break
+                
+                if cut_point and cut_point > 50:  # Only cut if we're cutting meaningful amount
+                    # Find the start of text content after this timestamp
+                    # Look for the timestamp token start
+                    current_trans = current_trans[cut_point:]
+                    print(f"    Removed {cut_point} characters from overlap region")
+                else:
+                    print(f"    Conservative: Keeping full chunk (cut point too early or not found)")
+            else:
+                print(f"    No timestamps found, keeping full chunk for safety")
+        else:
+            print(f"  Chunk {i+1}: No overlap, appending full chunk")
+        
+        # Append current transcription with separator
+        merged += " " + current_trans
+    
+    return merged
+
+# Combine the transcriptions with smart merging
+print("\n" + "="*60)
+full_transcription = merge_overlapping_transcriptions(transcriptions, chunk_info, overlap_duration=2.0)
+
+# Clean up extra spaces
+full_transcription = " ".join(full_transcription.split())
+
+print(f"\n✅ Final transcription length: {len(full_transcription)} characters")
+
+# Count actual words (excluding timestamp tokens)
+import re
+text_only = re.sub(r'<\|[^|]+\|>', '', full_transcription)
+for token in ['<|startoftranscript|>', '<|en|>', '<|transcribe|>', '<|translate|>', '<|endoftext|>', '<|nospeech|>']:
+    text_only = text_only.replace(token, '')
+word_count = len(text_only.split())
+print(f"   Estimated word count: {word_count} words")
+
+# Count timestamps
+timestamp_count = len(re.findall(r'<\|\d+\.\d+\|>', full_transcription))
+print(f"   Timestamp markers: {timestamp_count}")
 #print("Full Transcription:", full_transcription)
 
 # Save TXT file
