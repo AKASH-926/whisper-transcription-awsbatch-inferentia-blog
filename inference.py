@@ -164,18 +164,101 @@ else:
 
 # Inference
 import torchaudio
+import ffmpeg
+import numpy as np
 
 # copy from s3
 s3_client.download_file(input_bucket_name, input_file_key, input_file_key.split("/")[-1])
 audio_path = input_file_key.split("/")[-1]
 
-# Load the audio file
-waveform, sample_rate = torchaudio.load(audio_path)
+def load_audio_with_fallback(file_path):
+    """
+    Load audio from various formats including MP4, with fallback mechanisms.
+    Supports: MP3, MP4, WAV, FLAC, OGG, M4A, WMA, AAC, and more.
+    
+    Returns:
+        tuple: (waveform as torch.Tensor, sample_rate as int)
+    """
+    print(f"Loading audio file: {file_path}")
+    
+    # Method 1: Try torchaudio first (fastest if it works)
+    try:
+        # Try to set ffmpeg backend for better format support
+        try:
+            torchaudio.set_audio_backend("ffmpeg")
+            print("Using torchaudio with ffmpeg backend")
+        except:
+            print("FFmpeg backend not available for torchaudio, using default backend")
+        
+        waveform, sample_rate = torchaudio.load(file_path)
+        print(f"Successfully loaded with torchaudio: {sample_rate}Hz, {waveform.shape}")
+        return waveform, sample_rate
+    except Exception as e:
+        print(f"torchaudio failed: {e}")
+        print("Falling back to ffmpeg-python...")
+    
+    # Method 2: Use ffmpeg-python for broader format support (MP4, video files, etc.)
+    try:
+        # Probe the file to get info
+        probe = ffmpeg.probe(file_path)
+        audio_info = next((stream for stream in probe['streams'] if stream['codec_type'] == 'audio'), None)
+        
+        if audio_info is None:
+            raise Exception("No audio stream found in file")
+        
+        original_sample_rate = int(audio_info['sample_rate'])
+        print(f"File info: {audio_info['codec_name']} codec, {original_sample_rate}Hz")
+        
+        # Extract audio using ffmpeg and convert to 16kHz mono
+        out, _ = (
+            ffmpeg
+            .input(file_path)
+            .output('pipe:', format='f32le', acodec='pcm_f32le', ac=1, ar='16000')
+            .run(capture_stdout=True, capture_stderr=True, quiet=True)
+        )
+        
+        # Convert bytes to numpy array then to torch tensor
+        audio_np = np.frombuffer(out, np.float32)
+        waveform = torch.from_numpy(audio_np).unsqueeze(0)  # Add channel dimension
+        sample_rate = 16000
+        
+        print(f"Successfully loaded with ffmpeg: {sample_rate}Hz, {waveform.shape}")
+        return waveform, sample_rate
+        
+    except Exception as e:
+        print(f"ffmpeg-python failed: {e}")
+        print("Falling back to librosa...")
+    
+    # Method 3: Final fallback to librosa (slowest but most compatible)
+    try:
+        import librosa
+        audio_np, sample_rate = librosa.load(file_path, sr=None, mono=False)
+        
+        # Convert to torch tensor and ensure correct shape
+        if audio_np.ndim == 1:
+            waveform = torch.from_numpy(audio_np).unsqueeze(0)
+        else:
+            waveform = torch.from_numpy(audio_np)
+        
+        print(f"Successfully loaded with librosa: {sample_rate}Hz, {waveform.shape}")
+        return waveform, sample_rate
+        
+    except Exception as e:
+        raise Exception(f"All audio loading methods failed. Last error: {e}")
+
+# Load the audio file with fallback support for various formats
+try:
+    waveform, sample_rate = load_audio_with_fallback(audio_path)
+except Exception as e:
+    print(f"ERROR: Failed to load audio file: {e}")
+    raise
 
 # Ensure the audio is in the correct format (mono, 16kHz)
 if waveform.shape[0] > 1:
+    print(f"Converting from {waveform.shape[0]} channels to mono")
     waveform = torch.mean(waveform, dim=0, keepdim=True)
 if sample_rate != 16000:
+    print(f"Resampling from {sample_rate}Hz to 16000Hz")
     waveform = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)(waveform)
 
 # Chunk the audio with overlap to avoid cutting sentences

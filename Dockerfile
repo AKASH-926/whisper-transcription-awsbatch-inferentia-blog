@@ -3,6 +3,9 @@ FROM public.ecr.aws/neuron/pytorch-inference-neuronx:1.13.1-neuronx-py310-sdk2.2
 RUN mkdir -p /app
 WORKDIR /app
 
+# Install FFmpeg for audio/video format support (MP4, etc.)
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt requirements.txt
 COPY inference.py inference.py
 
